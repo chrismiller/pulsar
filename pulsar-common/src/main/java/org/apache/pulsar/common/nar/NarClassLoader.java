@@ -124,12 +124,9 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class NarClassLoader extends URLClassLoader {
 
-    private static final FileFilter JAR_FILTER = new FileFilter() {
-        @Override
-        public boolean accept(File pathname) {
-            final String nameToTest = pathname.getName().toLowerCase();
-            return nameToTest.endsWith(".jar") && pathname.isFile();
-        }
+    private static final FileFilter JAR_FILTER = pathname -> {
+        final String nameToTest = pathname.getName().toLowerCase();
+        return nameToTest.endsWith(".jar") && pathname.isFile();
     };
 
     /**
@@ -144,7 +141,16 @@ public class NarClassLoader extends URLClassLoader {
     public static NarClassLoader getFromArchive(File narPath, Set<String> additionalJars) throws IOException {
         File unpacked = NarUnpacker.unpackNar(narPath, NAR_CACHE_DIR);
         try {
-            return new NarClassLoader(unpacked, additionalJars);
+            return new NarClassLoader(unpacked, additionalJars, NarClassLoader.class.getClassLoader() );
+        } catch (ClassNotFoundException e) {
+            throw new IOException(e);
+        }
+    }
+
+    public static NarClassLoader getFromArchive(File narPath, Set<String> additionalJars, ClassLoader parent) throws IOException {
+        File unpacked = NarUnpacker.unpackNar(narPath, NAR_CACHE_DIR);
+        try {
+            return new NarClassLoader(unpacked, additionalJars, parent);
         } catch (ClassNotFoundException e) {
             throw new IOException(e);
         }
@@ -155,6 +161,7 @@ public class NarClassLoader extends URLClassLoader {
      *
      * @param narWorkingDirectory
      *            directory to explode nar contents to
+     * @param parent
      * @throws IllegalArgumentException
      *             if the NAR is missing the Java Services API file for <tt>FlowFileProcessor</tt> implementations.
      * @throws ClassNotFoundException
@@ -163,9 +170,9 @@ public class NarClassLoader extends URLClassLoader {
      * @throws IOException
      *             if an error occurs while loading the NAR.
      */
-    private NarClassLoader(final File narWorkingDirectory, Set<String> additionalJars)
+    private NarClassLoader(final File narWorkingDirectory, Set<String> additionalJars, ClassLoader parent)
             throws ClassNotFoundException, IOException {
-        super(new URL[0]);
+        super(new URL[0], parent);
         this.narWorkingDirectory = narWorkingDirectory;
 
         // process the classpath

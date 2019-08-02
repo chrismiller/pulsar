@@ -19,15 +19,22 @@
 package org.apache.pulsar.functions.instance;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static org.apache.commons.lang3.StringUtils.isEmpty;
 
 import lombok.experimental.UtilityClass;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.functions.api.SerDe;
+import org.apache.pulsar.functions.proto.Function;
+import org.apache.pulsar.functions.sink.PulsarSink;
 import org.apache.pulsar.functions.utils.Reflections;
 
 import net.jodah.typetools.TypeResolver;
+import org.apache.pulsar.functions.utils.FunctionCommon;
+
+import java.util.HashMap;
+import java.util.Map;
 
 @UtilityClass
 public class InstanceUtils {
@@ -76,5 +83,57 @@ public class InstanceUtils {
         } else {
             return Reflections.createInstance(className, baseClass, clsLoader);
         }
+    }
+
+    public Function.FunctionDetails.ComponentType calculateSubjectType(Function.FunctionDetails functionDetails) {
+        if (functionDetails.getComponentType() != Function.FunctionDetails.ComponentType.UNKNOWN) {
+            return functionDetails.getComponentType();
+        }
+        Function.SourceSpec sourceSpec = functionDetails.getSource();
+        Function.SinkSpec sinkSpec = functionDetails.getSink();
+        if (sourceSpec.getInputSpecsCount() == 0) {
+            return Function.FunctionDetails.ComponentType.SOURCE;
+        }
+        // Now its between sink and function
+
+        if (!isEmpty(sinkSpec.getBuiltin())) {
+            // if its built in, its a sink
+            return Function.FunctionDetails.ComponentType.SINK;
+        }
+
+        if (isEmpty(sinkSpec.getClassName()) || sinkSpec.getClassName().equals(PulsarSink.class.getName())) {
+            return Function.FunctionDetails.ComponentType.FUNCTION;
+        }
+        return Function.FunctionDetails.ComponentType.SINK;
+    }
+
+    public static String getDefaultSubscriptionName(String tenant, String namespace, String name) {
+        return FunctionCommon.getFullyQualifiedName(tenant, namespace, name);
+    }
+
+    public static String getDefaultSubscriptionName(Function.FunctionDetails functionDetails) {
+        return getDefaultSubscriptionName(
+                functionDetails.getTenant(),
+                functionDetails.getNamespace(),
+                functionDetails.getName());
+    }
+
+    public static Map<String, String> getProperties(Function.FunctionDetails.ComponentType componentType,
+                                                    String fullyQualifiedName, int instanceId) {
+        Map<String, String> properties = new HashMap<>();
+        switch (componentType) {
+            case FUNCTION:
+                properties.put("application", "pulsar-function");
+                break;
+            case SOURCE:
+                properties.put("application", "pulsar-source");
+                break;
+            case SINK:
+                properties.put("application", "pulsar-sink");
+                break;
+        }
+        properties.put("id", fullyQualifiedName);
+        properties.put("instance_id", String.valueOf(instanceId));
+        return properties;
     }
 }

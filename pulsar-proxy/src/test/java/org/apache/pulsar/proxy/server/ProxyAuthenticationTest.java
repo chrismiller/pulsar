@@ -21,14 +21,11 @@ package org.apache.pulsar.proxy.server;
 import static org.mockito.Mockito.spy;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Map.Entry;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.Set;
 
 import javax.naming.AuthenticationException;
@@ -41,27 +38,19 @@ import org.apache.pulsar.broker.authentication.AuthenticationService;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.api.Authentication;
 import org.apache.pulsar.client.api.AuthenticationDataProvider;
-import org.apache.pulsar.client.api.Consumer;
-import org.apache.pulsar.client.api.Message;
-import org.apache.pulsar.client.api.MessageId;
-import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.ProducerConsumerBase;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Schema;
-import org.apache.pulsar.client.impl.ConsumerImpl;
 import org.apache.pulsar.common.configuration.PulsarConfigurationLoader;
 import org.apache.pulsar.common.policies.data.AuthAction;
-import org.apache.pulsar.common.util.FutureUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import com.google.common.collect.Sets;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -174,7 +163,6 @@ public class ProxyAuthenticationTest extends ProducerConsumerBase {
 		servicePort = PortManager.nextFreePort();
 		conf.setAuthenticationEnabled(true);
 		conf.setAuthorizationEnabled(true);
-		conf.setTlsEnabled(false);
 		conf.setBrokerClientAuthenticationPlugin(BasicAuthentication.class.getName());
 		// Expires after an hour
 		conf.setBrokerClientAuthenticationParameters(
@@ -229,8 +217,8 @@ public class ProxyAuthenticationTest extends ProducerConsumerBase {
 		// Step 2: Try to use proxy Client as a normal Client - expect exception
 		ProxyConfiguration proxyConfig = new ProxyConfiguration();
 		proxyConfig.setAuthenticationEnabled(true);
-		proxyConfig.setServicePort(servicePort);
-		proxyConfig.setWebServicePort(webServicePort);
+		proxyConfig.setServicePort(Optional.ofNullable(servicePort));
+		proxyConfig.setWebServicePort(Optional.ofNullable(webServicePort));
 		proxyConfig.setBrokerServiceURL("pulsar://localhost:" + BROKER_PORT);
 
 		proxyConfig.setBrokerClientAuthenticationPlugin(BasicAuthentication.class.getName());

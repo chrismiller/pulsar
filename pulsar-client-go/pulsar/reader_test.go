@@ -22,6 +22,8 @@ package pulsar
 import (
 	"context"
 	"fmt"
+	"github.com/stretchr/testify/assert"
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +34,7 @@ func TestReaderConnectError(t *testing.T) {
 		URL: "pulsar://invalid-hostname:6650",
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 
 	defer client.Close()
 
@@ -42,10 +44,10 @@ func TestReaderConnectError(t *testing.T) {
 	})
 
 	// Expect error in creating reader
-	assertNil(t, reader)
-	assertNotNil(t, err)
+	assert.Nil(t, reader)
+	assert.NotNil(t, err)
 
-	assertEqual(t, err.(*Error).Result(), ConnectError);
+	assert.Equal(t, err.(*Error).Result(), ConnectError)
 }
 
 func TestReader(t *testing.T) {
@@ -53,25 +55,27 @@ func TestReader(t *testing.T) {
 		URL: "pulsar://localhost:6650",
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer client.Close()
 
+	topic := fmt.Sprintf("my-reader-topic-%d", time.Now().Unix())
+
 	producer, err := client.CreateProducer(ProducerOptions{
-		Topic: "my-reader-topic",
+		Topic: topic,
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer producer.Close()
 
 	reader, err := client.CreateReader(ReaderOptions{
-		Topic:          "my-reader-topic",
+		Topic:          topic,
 		StartMessageID: LatestMessage,
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer reader.Close()
 
-	assertEqual(t, reader.Topic(), "persistent://public/default/my-reader-topic")
+	assert.Equal(t, reader.Topic(), "persistent://public/default/"+topic)
 
 	ctx := context.Background()
 
@@ -83,19 +87,19 @@ func TestReader(t *testing.T) {
 		}
 
 		hasNext, err := reader.HasNext()
-		assertNil(t, err)
-		assertEqual(t, hasNext, true)
+		assert.Nil(t, err)
+		assert.Equal(t, hasNext, true)
 
 		msg, err := reader.Next(ctx)
-		assertNil(t, err)
-		assertNotNil(t, msg)
+		assert.Nil(t, err)
+		assert.NotNil(t, msg)
 
-		assertEqual(t, string(msg.Payload()), fmt.Sprintf("hello-%d", i))
+		assert.Equal(t, string(msg.Payload()), fmt.Sprintf("hello-%d", i))
 	}
 
 	hasNext, err := reader.HasNext()
-	assertNil(t, err)
-	assertEqual(t, hasNext, false)
+	assert.Nil(t, err)
+	assert.Equal(t, hasNext, false)
 }
 
 func TestReaderWithInvalidConf(t *testing.T) {
@@ -115,29 +119,28 @@ func TestReaderWithInvalidConf(t *testing.T) {
 	})
 
 	// Expect error in creating cosnumer
-	assertNil(t, reader)
-	assertNotNil(t, err)
+	assert.Nil(t, reader)
+	assert.NotNil(t, err)
 
-	assertEqual(t, err.(*Error).Result(), InvalidConfiguration)
+	assert.Equal(t, err.(*Error).Result(), InvalidConfiguration)
 
 	reader, err = client.CreateReader(ReaderOptions{
 		StartMessageID: LatestMessage,
 	})
 
 	// Expect error in creating cosnumer
-	assertNil(t, reader)
-	assertNotNil(t, err)
+	assert.Nil(t, reader)
+	assert.NotNil(t, err)
 
-	assertEqual(t, err.(*Error).Result(), InvalidConfiguration)
+	assert.Equal(t, err.(*Error).Result(), InvalidConfiguration)
 }
-
 
 func TestReaderCompaction(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		URL: "pulsar://localhost:6650",
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer client.Close()
 
 	topic := fmt.Sprintf("my-reader-compaction-topic-%d", time.Now().Unix())
@@ -146,7 +149,7 @@ func TestReaderCompaction(t *testing.T) {
 		Topic: topic,
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer producer.Close()
 
 	ctx := context.Background()
@@ -170,7 +173,7 @@ func TestReaderCompaction(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		} else {
-			assertEqual(t, strings.Contains(res, "SUCCESS"), true)
+			assert.Equal(t, strings.Contains(res, "SUCCESS"), true)
 			fmt.Println("Compaction is done")
 			break
 		}
@@ -183,7 +186,7 @@ func TestReaderCompaction(t *testing.T) {
 		StartMessageID: EarliestMessage,
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer reader1.Close()
 
 	reader2, err := client.CreateReader(ReaderOptions{
@@ -192,30 +195,72 @@ func TestReaderCompaction(t *testing.T) {
 		ReadCompacted:  true,
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer reader2.Close()
 
 	// Reader-1 will receive all messages
 	for i := 0; i < 10; i++ {
 		msg, err := reader1.Next(context.Background())
-		assertNil(t, err)
-		assertNotNil(t, msg)
+		assert.Nil(t, err)
+		assert.NotNil(t, msg)
 
-		assertEqual(t, string(msg.Payload()), fmt.Sprintf("hello-%d", i))
+		assert.Equal(t, string(msg.Payload()), fmt.Sprintf("hello-%d", i))
 	}
 
 	// Reader-2 will only receive the last message
 	msg, err := reader2.Next(context.Background())
-	assertNil(t, err)
-	assertNotNil(t, msg)
-	assertEqual(t, string(msg.Payload()), fmt.Sprintf("hello-9"))
+	assert.Nil(t, err)
+	assert.NotNil(t, msg)
+	assert.Equal(t, string(msg.Payload()), fmt.Sprintf("hello-9"))
 
 	// No more messages on consumer-2
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
 	msg, err = reader2.Next(ctx)
-	assertNil(t, msg)
-	assertNotNil(t, err)
+	assert.Nil(t, msg)
+	assert.NotNil(t, err)
 }
 
+func TestReaderHasNext(t *testing.T) {
+	topic := fmt.Sprintf("TestReaderHasNext-%d", rand.Int())
+	ctx := context.Background()
+
+	client, err := NewClient(ClientOptions{
+		URL: "pulsar://localhost:6650",
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic: topic,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	// Send a message.
+	err = producer.Send(ctx, ProducerMessage{})
+	assert.Nil(t, err)
+
+	reader, err := client.CreateReader(ReaderOptions{
+		Topic:          topic,
+		StartMessageID: EarliestMessage,
+	})
+	assert.Nil(t, err)
+	defer reader.Close()
+
+	var hasNext bool
+
+	// Now we have 1 message to read
+	hasNext, err = reader.HasNext()
+	assert.Nil(t, err)
+	assert.True(t, hasNext)
+
+	_, err = reader.Next(ctx)
+	assert.Nil(t, err)
+
+	// Now there is no message left
+	hasNext, err = reader.HasNext()
+	assert.Nil(t, err)
+	assert.False(t, hasNext)
+}

@@ -21,16 +21,15 @@
 
 #include <iosfwd>
 #include <stdint.h>
-#include <boost/shared_ptr.hpp>
-//#include <lib/MessageIdImpl.h>
-
-#pragma GCC visibility push(default)
+#include <memory>
+#include <string>
+#include <pulsar/defines.h>
 
 namespace pulsar {
 
 class MessageIdImpl;
 
-class MessageId {
+class PULSAR_PUBLIC MessageId {
    public:
     MessageId& operator=(const MessageId&);
     MessageId();
@@ -52,7 +51,7 @@ class MessageId {
     void serialize(std::string& result) const;
 
     /**
-     * Get the topic Name
+     * Get the topic Name from which this message originated from
      */
     const std::string& getTopicName() const;
 
@@ -87,19 +86,18 @@ class MessageId {
     friend class BatchAcknowledgementTracker;
     friend class PulsarWrapper;
     friend class PulsarFriend;
+    friend class NegativeAcksTracker;
 
-    friend std::ostream& operator<<(std::ostream& s, const MessageId& messageId);
+    friend PULSAR_PUBLIC std::ostream& operator<<(std::ostream& s, const MessageId& messageId);
 
     int64_t ledgerId() const;
     int64_t entryId() const;
     int32_t batchIndex() const;
     int32_t partition() const;
 
-    typedef boost::shared_ptr<MessageIdImpl> MessageIdImplPtr;
+    typedef std::shared_ptr<MessageIdImpl> MessageIdImplPtr;
     MessageIdImplPtr impl_;
 };
 }  // namespace pulsar
-
-#pragma GCC visibility pop
 
 #endif  // MESSAGE_ID_H

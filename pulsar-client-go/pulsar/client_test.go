@@ -20,16 +20,19 @@
 package pulsar
 
 import (
+	"context"
 	"fmt"
+	"github.com/stretchr/testify/assert"
+	"io/ioutil"
 	"testing"
 )
 
 func TestGetTopicPartitions(t *testing.T) {
 	client, err := NewClient(ClientOptions{
-		URL:                      "pulsar://localhost:6650",
+		URL: "pulsar://localhost:6650",
 	})
 
-	assertNil(t, err)
+	assert.Nil(t, err)
 	defer client.Close()
 
 	// Create topic with 5 partitions
@@ -39,10 +42,10 @@ func TestGetTopicPartitions(t *testing.T) {
 	partitionedTopic := "persistent://public/default/TestGetTopicPartitions"
 
 	partitions, err := client.TopicPartitions(partitionedTopic)
-	assertNil(t, err)
-	assertEqual(t, len(partitions), 5)
+	assert.Nil(t, err)
+	assert.Equal(t, len(partitions), 5)
 	for i := 0; i < 5; i++ {
-		assertEqual(t, partitions[i],
+		assert.Equal(t, partitions[i],
 			fmt.Sprintf("%s-partition-%d", partitionedTopic, i))
 	}
 
@@ -50,7 +53,102 @@ func TestGetTopicPartitions(t *testing.T) {
 	topic := "persistent://public/default/TestGetTopicPartitions-nopartitions"
 
 	partitions, err = client.TopicPartitions(topic)
-	assertNil(t, err)
-	assertEqual(t, len(partitions), 1)
-	assertEqual(t, partitions[0], topic)
+	assert.Nil(t, err)
+	assert.Equal(t, len(partitions), 1)
+	assert.Equal(t, partitions[0], topic)
+}
+
+const TestTokenFilePath = "/tmp/pulsar-test-data/tokens/token.txt"
+
+func readToken(t *testing.T) string {
+	data, err := ioutil.ReadFile(TestTokenFilePath)
+	assert.Nil(t, err)
+
+	return string(data)
+}
+
+func TestTokenAuth(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL:            "pulsar://localhost:6650",
+		Authentication: NewAuthenticationToken(readToken(t)),
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := "persistent://private/auth/TestTokenAuth"
+
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic: topic,
+	})
+
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		if err := producer.Send(ctx, ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestTokenAuthSupplier(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: "pulsar://localhost:6650",
+		Authentication: NewAuthenticationTokenSupplier(func() string {
+			return readToken(t)
+		}),
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := "persistent://private/auth/TestTokenAuth"
+
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic: topic,
+	})
+
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		if err := producer.Send(ctx, ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+var (
+	caPath               = "cacert.pem"
+	clientPublicKeyPath  = "client-cert.pem"
+	clientPrivateKeyPath = "client-key.pem"
+)
+
+func TestClient_ValidationHostName(t *testing.T) {
+	conf := &ClientOptions{
+		URL:                        "https://localhost:8443",
+		TLSAllowInsecureConnection: false,
+		TLSValidateHostname:        true,
+		TLSTrustCertsFilePath:      caPath,
+		Authentication:             NewAuthenticationTLS(clientPublicKeyPath, clientPrivateKeyPath),
+	}
+
+	client, err := NewClient(*conf)
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topicName := "persistent://private/auth/test-tls-detect-https"
+	_, err = client.CreateProducer(ProducerOptions{
+		Topic: topicName,
+	})
+	assert.NotNil(t, err)
 }

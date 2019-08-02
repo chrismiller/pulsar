@@ -18,33 +18,26 @@
  */
 package org.apache.pulsar.functions.worker;
 
-import static org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest.retryStrategically;
-import static org.mockito.Mockito.spy;
-import static org.testng.Assert.assertEquals;
-import static org.testng.Assert.assertFalse;
-
-import java.lang.reflect.Method;
-import java.net.InetAddress;
-import java.net.URI;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import com.google.gson.Gson;
 import org.apache.bookkeeper.test.PortManager;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.ServiceConfigurationUtils;
+import org.apache.pulsar.broker.authentication.AuthenticationService;
 import org.apache.pulsar.broker.loadbalance.impl.SimpleLoadManagerImpl;
 import org.apache.pulsar.client.admin.BrokerStats;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.client.api.ClientBuilder;
 import org.apache.pulsar.client.api.PulsarClient;
+import org.apache.pulsar.common.configuration.PulsarConfigurationLoader;
+import org.apache.pulsar.common.functions.FunctionConfig;
 import org.apache.pulsar.common.functions.Utils;
 import org.apache.pulsar.common.policies.data.ClusterData;
 import org.apache.pulsar.common.policies.data.TenantInfo;
 import org.apache.pulsar.functions.proto.Function.Assignment;
-import org.apache.pulsar.common.functions.FunctionConfig;
 import org.apache.pulsar.zookeeper.LocalBookkeeperEnsemble;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,9 +45,15 @@ import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
-import com.google.common.collect.Sets;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
-import jersey.repackaged.com.google.common.collect.Lists;
+import static org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest.retryStrategically;
+import static org.mockito.Mockito.spy;
+import static org.testng.Assert.assertEquals;
 
 /**
  * Test Pulsar sink on function
@@ -71,7 +70,7 @@ public class PulsarWorkerAssignmentTest {
     BrokerStats brokerStatsClient;
     WorkerService functionsWorkerService;
     final String tenant = "external-repl-prop";
-    String pulsarFunctionsNamespace = tenant + "/use/pulsar-function-admin";
+    final String pulsarFunctionsNamespace = tenant + "/use/pulsar-function-admin";
     String primaryHost;
     String workerId;
 
@@ -82,7 +81,7 @@ public class PulsarWorkerAssignmentTest {
 
     private static final Logger log = LoggerFactory.getLogger(PulsarWorkerAssignmentTest.class);
 
-    @BeforeMethod
+    @BeforeMethod(timeOut = 60000)
     void setup(Method method) throws Exception {
 
         log.info("--- Setting up method {} ---", method.getName());
@@ -91,36 +90,37 @@ public class PulsarWorkerAssignmentTest {
         bkEnsemble = new LocalBookkeeperEnsemble(3, ZOOKEEPER_PORT, () -> PortManager.nextFreePort());
         bkEnsemble.start();
 
-        String brokerServiceUrl = "http://127.0.0.1:" + brokerServicePort;
-        String brokerWeServiceUrl = "http://127.0.0.1:" + brokerWebServicePort;
+        final String brokerServiceUrl = "http://127.0.0.1:" + brokerServicePort;
+        final String brokerWeServiceUrl = "http://127.0.0.1:" + brokerWebServicePort;
 
         config = spy(new ServiceConfiguration());
         config.setClusterName("use");
-        Set<String> superUsers = Sets.newHashSet("superUser");
+        final Set<String> superUsers = Sets.newHashSet("superUser");
         config.setSuperUserRoles(superUsers);
-        config.setWebServicePort(brokerWebServicePort);
+        config.setWebServicePort(Optional.ofNullable(brokerWebServicePort));
         config.setZookeeperServers("127.0.0.1" + ":" + ZOOKEEPER_PORT);
-        config.setBrokerServicePort(brokerServicePort);
+        config.setBrokerServicePort(Optional.ofNullable(brokerServicePort));
         config.setLoadManagerClassName(SimpleLoadManagerImpl.class.getName());
+        config.setAdvertisedAddress("localhost");
 
         functionsWorkerService = createPulsarFunctionWorker(config);
-        Optional<WorkerService> functionWorkerService = Optional.of(functionsWorkerService);
+        final Optional<WorkerService> functionWorkerService = Optional.of(functionsWorkerService);
         pulsar = new PulsarService(config, functionWorkerService);
         pulsar.start();
 
         admin = spy(PulsarAdmin.builder().serviceHttpUrl(brokerWeServiceUrl).build());
 
         brokerStatsClient = admin.brokerStats();
-        primaryHost = String.format("http://%s:%d", InetAddress.getLocalHost().getHostName(), brokerWebServicePort);
+        primaryHost = String.format("http://%s:%d", "localhost", brokerWebServicePort);
 
         // update cluster metadata
-        ClusterData clusterData = new ClusterData(brokerServiceUrl);
+        final ClusterData clusterData = new ClusterData(brokerServiceUrl);
         admin.clusters().updateCluster(config.getClusterName(), clusterData);
 
-        ClientBuilder clientBuilder = PulsarClient.builder().serviceUrl(this.workerConfig.getPulsarServiceUrl());
+        final ClientBuilder clientBuilder = PulsarClient.builder().serviceUrl(this.workerConfig.getPulsarServiceUrl());
         pulsarClient = clientBuilder.build();
 
-        TenantInfo propAdmin = new TenantInfo();
+        final TenantInfo propAdmin = new TenantInfo();
         propAdmin.getAdminRoles().add("superUser");
         propAdmin.setAllowedClusters(Sets.newHashSet(Lists.newArrayList("use")));
         admin.tenants().updateTenant(tenant, propAdmin);
@@ -149,8 +149,8 @@ public class PulsarWorkerAssignmentTest {
                 org.apache.pulsar.functions.worker.scheduler.RoundRobinScheduler.class.getName());
         workerConfig.setThreadContainerFactory(new WorkerConfig.ThreadContainerFactory().setThreadGroupName("use"));
         // worker talks to local broker
-        workerConfig.setPulsarServiceUrl("pulsar://127.0.0.1:" + config.getBrokerServicePort());
-        workerConfig.setPulsarWebServiceUrl("http://127.0.0.1:" + config.getWebServicePort());
+        workerConfig.setPulsarServiceUrl("pulsar://127.0.0.1:" + config.getBrokerServicePort().get());
+        workerConfig.setPulsarWebServiceUrl("http://127.0.0.1:" + config.getWebServicePort().get());
         workerConfig.setFailureCheckFreqMs(100);
         workerConfig.setNumFunctionPackageReplicas(1);
         workerConfig.setClusterCoordinationTopicName("coordinate");
@@ -159,8 +159,8 @@ public class PulsarWorkerAssignmentTest {
         workerConfig.setInstanceLivenessCheckFreqMs(100);
         workerConfig.setWorkerPort(workerServicePort);
         workerConfig.setPulsarFunctionsCluster(config.getClusterName());
-        String hostname = ServiceConfigurationUtils.getDefaultOrConfiguredAddress(config.getAdvertisedAddress());
-        this.workerId = "c-" + config.getClusterName() + "-fw-" + hostname + "-" + workerConfig.getWorkerPort();
+        final String hostname = ServiceConfigurationUtils.getDefaultOrConfiguredAddress(config.getAdvertisedAddress());
+        workerId = "c-" + config.getClusterName() + "-fw-" + hostname + "-" + workerConfig.getWorkerPort();
         workerConfig.setWorkerHostname(hostname);
         workerConfig.setWorkerId(workerId);
         workerConfig.setTopicCompactionFrequencySec(1);
@@ -168,7 +168,7 @@ public class PulsarWorkerAssignmentTest {
         return new WorkerService(workerConfig);
     }
 
-    @Test
+    @Test(timeOut = 60000, enabled = false)
     public void testFunctionAssignments() throws Exception {
 
         final String namespacePortion = "assignment-test";
@@ -177,10 +177,10 @@ public class PulsarWorkerAssignmentTest {
         final String functionName = "assign";
         final String subscriptionName = "test-sub";
         admin.namespaces().createNamespace(replNamespace);
-        Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
+        final Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
         admin.namespaces().setNamespaceReplicationClusters(replNamespace, clusters);
 
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        final String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
         FunctionConfig functionConfig = createFunctionConfig(tenant, namespacePortion,
                 functionName, "my.*", sinkTopic, subscriptionName);
         functionConfig.setParallelism(2);
@@ -214,34 +214,35 @@ public class PulsarWorkerAssignmentTest {
             }
         }, 5, 150);
         // validate pulsar sink consumer has started on the topic
+        log.info("admin.topics().getStats(sinkTopic): {}", new Gson().toJson(admin.topics().getStats(sinkTopic)));
         assertEquals(admin.topics().getStats(sinkTopic).subscriptions.values().iterator().next().consumers.size(), 1);
     }
 
-    @Test(timeOut=20000)
+    @Test(timeOut = 60000, enabled = false)
     public void testFunctionAssignmentsWithRestart() throws Exception {
 
         final String namespacePortion = "assignment-test";
         final String replNamespace = tenant + "/" + namespacePortion;
         final String sinkTopic = "persistent://" + replNamespace + "/my-topic1";
+        final String logTopic = "persistent://" + replNamespace + "/log-topic";
         final String baseFunctionName = "assign-restart";
         final String subscriptionName = "test-sub";
         final int totalFunctions = 5;
         final int parallelism = 2;
         admin.namespaces().createNamespace(replNamespace);
-        Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
+        final Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
         admin.namespaces().setNamespaceReplicationClusters(replNamespace, clusters);
         final FunctionRuntimeManager runtimeManager = functionsWorkerService.getFunctionRuntimeManager();
 
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
-        FunctionConfig functionConfig = null;
+        final String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        FunctionConfig functionConfig;
         // (1) Register functions with 2 instances
         for (int i = 0; i < totalFunctions; i++) {
             String functionName = baseFunctionName + i;
             functionConfig = createFunctionConfig(tenant, namespacePortion, functionName,
                     "my.*", sinkTopic, subscriptionName);
             functionConfig.setParallelism(parallelism);
-            // set-auto-ack prop =true
-            functionConfig.setAutoAck(true);
+            // don't set any log topic
             admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
         }
         retryStrategically((test) -> {
@@ -263,12 +264,12 @@ public class PulsarWorkerAssignmentTest {
             functionConfig = createFunctionConfig(tenant, namespacePortion, functionName,
                     "my.*", sinkTopic, subscriptionName);
             functionConfig.setParallelism(parallelism);
-            // set-auto-ack prop =false
-            functionConfig.setAutoAck(false);
+            // Now set the log topic
+            functionConfig.setLogTopic(logTopic);
             admin.functions().updateFunctionWithUrl(functionConfig, jarFilePathUrl);
         }
 
-        int totalDeletedFunction = 2;
+        final int totalDeletedFunction = 2;
         for (int i = (totalFunctions - 1); i >= (totalFunctions - totalDeletedFunction); i--) {
             String functionName = baseFunctionName + i;
             admin.functions().deleteFunction(tenant, namespacePortion, functionName);
@@ -287,11 +288,11 @@ public class PulsarWorkerAssignmentTest {
         assertEquals(assignments.size(), ((totalFunctions - totalDeletedFunction) * parallelism));
 
         // (3) Restart worker service and check registered functions
-        URI dlUri = functionsWorkerService.getDlogUri();
+        final URI dlUri = functionsWorkerService.getDlogUri();
         functionsWorkerService.stop();
         functionsWorkerService = new WorkerService(workerConfig);
-        functionsWorkerService.start(dlUri);
-        FunctionRuntimeManager runtimeManager2 = functionsWorkerService.getFunctionRuntimeManager();
+        functionsWorkerService.start(dlUri, new AuthenticationService(PulsarConfigurationLoader.convertFrom(workerConfig)), null);
+        final FunctionRuntimeManager runtimeManager2 = functionsWorkerService.getFunctionRuntimeManager();
         retryStrategically((test) -> {
             try {
                 Map<String, Assignment> assgn = runtimeManager2.getCurrentAssignments().values().iterator().next();
@@ -305,19 +306,19 @@ public class PulsarWorkerAssignmentTest {
         assignments = runtimeManager2.getCurrentAssignments().values().iterator().next();
         assertEquals(assignments.size(), ((totalFunctions - totalDeletedFunction) * parallelism));
 
-        // validate updated function prop = auto-ack=false and instnaceid
+        // validate updated function prop = auto-ack=false and instance id
         for (int i = 0; i < (totalFunctions - totalDeletedFunction); i++) {
-            String functionName = baseFunctionName + i;
-            assertFalse(admin.functions().getFunction(tenant, namespacePortion, functionName).getAutoAck());
+            final String functionName = baseFunctionName + i;
+            assertEquals(admin.functions().getFunction(tenant, namespacePortion, functionName).getLogTopic(), logTopic);
         }
     }
 
     protected static FunctionConfig createFunctionConfig(String tenant, String namespace,
                                                          String functionName, String sourceTopic, String sinkTopic, String subscriptionName) {
 
-        String sourceTopicPattern = String.format("persistent://%s/%s/%s", tenant, namespace, sourceTopic);
+        final String sourceTopicPattern = String.format("persistent://%s/%s/%s", tenant, namespace, sourceTopic);
 
-        FunctionConfig functionConfig = new FunctionConfig();
+        final FunctionConfig functionConfig = new FunctionConfig();
         functionConfig.setTenant(tenant);
         functionConfig.setNamespace(namespace);
         functionConfig.setName(functionName);

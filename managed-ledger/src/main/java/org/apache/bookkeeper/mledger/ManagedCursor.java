@@ -467,7 +467,7 @@ public interface ManagedCursor {
             throws InterruptedException, ManagedLedgerException;
 
     /**
-     * Read the specified set of positions from ManagedLedger.
+     * Read the specified set of positions from ManagedLedger without ordering.
      *
      * @param positions
      *            set of positions to read
@@ -480,6 +480,23 @@ public interface ManagedCursor {
      */
     Set<? extends Position> asyncReplayEntries(
         Set<? extends Position> positions, ReadEntriesCallback callback, Object ctx);
+
+    /**
+     * Read the specified set of positions from ManagedLedger.
+     *
+     * @param positions
+     *            set of positions to read
+     * @param callback
+     *            callback object returning the list of entries
+     * @param ctx
+     *            opaque context
+     * @param sortEntries
+     *            callback with sorted entry list.
+     * @return skipped positions
+     *              set of positions which are already deleted/acknowledged and skipped while replaying them
+     */
+    Set<? extends Position> asyncReplayEntries(
+            Set<? extends Position> positions, ReadEntriesCallback callback, Object ctx, boolean sortEntries);
 
     /**
      * Close the cursor and releases the associated resources.
@@ -517,6 +534,12 @@ public interface ManagedCursor {
      *
      */
     void setInactive();
+
+    /**
+     * A cursor that is set as always-inactive  will never trigger the caching of
+     * entries.
+     */
+    void setAlwaysInactive();
 
     /**
      * Checks if cursor is active or not.

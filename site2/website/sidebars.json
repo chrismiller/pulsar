@@ -1,6 +1,6 @@
 {
   "docs": {
-    "Getting started": [
+    "Get started": [
       "pulsar-2.0",
       "standalone",
       "standalone-docker",
@@ -18,6 +18,9 @@
       "concepts-tiered-storage",
       "concepts-schema-registry"
     ],
+    "Pulsar Schema": [
+      "schema-get-started"
+    ],
     "Pulsar Functions": [
       "functions-overview",
       "functions-quickstart",
@@ -25,14 +28,31 @@
       "functions-deploying",
       "functions-guarantees",
       "functions-state",
-      "functions-metrics"
+      "functions-metrics",
+      "functions-worker",
+      "functions-runtime",
+      "functions-deploying",
+      "functions-debugging"
+    ],
+    "Pulsar Functions（New）": [
+      "functions-overview-new",
+      "functions-worker",
+      "functions-runtime",
+      "functions-develop",
+      "functions-debug",
+      "functions-deploy",
+      "functions-configure",
+      "functions-monitor",
+      "functions-secure",
+      "functions-troubleshoot"
     ],
     "Pulsar IO": [
       "io-overview",
       "io-quickstart",
       "io-managing",
       "io-connectors",
-      "io-develop"
+      "io-develop",
+      "io-cdc"
     ],
     "Pulsar SQL": [
       "sql-overview",
@@ -52,14 +72,18 @@
       "administration-geo",
       "administration-dashboard",
       "administration-stats",
-      "administration-load-distribution",
-      "administration-proxy"
+      "administration-load-balance",
+      "administration-proxy",
+      "administration-upgrade"
     ],
     "Security": [
       "security-overview",
       "security-tls-transport",
       "security-tls-authentication",
+      "security-token-client",
+      "security-token-admin",
       "security-athenz",
+      "security-kerberos",
       "security-authorization",
       "security-encryption",
       "security-extending"
@@ -96,7 +120,8 @@
       "cookbooks-partitioned",
       "cookbooks-retention-expiry",
       "cookbooks-encryption",
-      "cookbooks-message-queue"
+      "cookbooks-message-queue",
+      "cookbooks-bookkeepermetadata"
     ],
     "Development": [
       "develop-tools",

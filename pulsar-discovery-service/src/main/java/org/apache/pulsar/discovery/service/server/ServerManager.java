@@ -53,32 +53,34 @@ public class ServerManager {
     private final Server server;
     private final ExecutorThreadPool webServiceExecutor;
     private final List<Handler> handlers = Lists.newArrayList();
-    protected final int externalServicePort;
 
     public ServerManager(ServiceConfig config) {
         this.webServiceExecutor = new ExecutorThreadPool();
         this.webServiceExecutor.setName("pulsar-external-web");
         this.server = new Server(webServiceExecutor);
-        this.externalServicePort = config.getWebServicePort();
 
         List<ServerConnector> connectors = Lists.newArrayList();
 
-        ServerConnector connector = new ServerConnector(server, 1, 1);
-        connector.setPort(externalServicePort);
-        connectors.add(connector);
+        if (config.getWebServicePort().isPresent()) {
+            ServerConnector connector = new ServerConnector(server, 1, 1);
+            connector.setPort(config.getWebServicePort().get());
+            connectors.add(connector);
+        }
 
-        if (config.isTlsEnabled()) {
+        if (config.getWebServicePortTls().isPresent()) {
             try {
                 SslContextFactory sslCtxFactory = SecurityUtility.createSslContextFactory(
                         config.isTlsAllowInsecureConnection(),
                         config.getTlsTrustCertsFilePath(),
                         config.getTlsCertificateFilePath(),
                         config.getTlsKeyFilePath(), 
-                        config.getTlsRequireTrustedClientCertOnConnect());
+                        config.getTlsRequireTrustedClientCertOnConnect(),
+                        true,
+                        config.getTlsCertRefreshCheckDurationSec());
                 ServerConnector tlsConnector = new ServerConnector(server, 1, 1, sslCtxFactory);
-                tlsConnector.setPort(config.getWebServicePortTls());
+                tlsConnector.setPort(config.getWebServicePortTls().get());
                 connectors.add(tlsConnector);
-            } catch (GeneralSecurityException e) {
+            } catch (Exception e) {
                 throw new RestException(e);
             }            
         }
@@ -100,10 +102,6 @@ public class ServerManager {
         holder.setInitParameters(initParameters);
         context.addServlet(holder, path);
         handlers.add(context);
-    }
-
-    public int getExternalServicePort() {
-        return externalServicePort;
     }
 
     public void start() throws Exception {

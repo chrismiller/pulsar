@@ -20,7 +20,12 @@ package org.apache.pulsar.broker.service;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotEquals;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.UnpooledByteBufAllocator;
 
 import java.lang.reflect.Field;
 import java.util.List;
@@ -39,14 +44,11 @@ import org.apache.bookkeeper.mledger.impl.ManagedCursorImpl;
 import org.apache.bookkeeper.test.MockedBookKeeperTestCase;
 import org.apache.pulsar.broker.service.persistent.PersistentMessageExpiryMonitor;
 import org.apache.pulsar.broker.service.persistent.PersistentMessageFinder;
-import org.apache.pulsar.common.api.ByteBufPair;
+import org.apache.pulsar.common.allocator.PulsarByteBufAllocator;
+import org.apache.pulsar.common.protocol.ByteBufPair;
 import org.apache.pulsar.common.api.proto.PulsarApi;
 import org.apache.pulsar.common.util.protobuf.ByteBufCodedOutputStream;
 import org.testng.annotations.Test;
-
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.buffer.UnpooledByteBufAllocator;
 
 /**
  */
@@ -64,7 +66,7 @@ public class PersistentMessageFinderTest extends MockedBookKeeperTestCase {
         int payloadSize = data.readableBytes();
         int totalSize = 4 + msgMetadataSize + payloadSize;
 
-        ByteBuf headers = PooledByteBufAllocator.DEFAULT.heapBuffer(totalSize, totalSize);
+        ByteBuf headers = PulsarByteBufAllocator.DEFAULT.heapBuffer(totalSize, totalSize);
         ByteBufCodedOutputStream outStream = ByteBufCodedOutputStream.get(headers);
         headers.writeInt(msgMetadataSize);
         messageMetadata.writeTo(outStream);
@@ -146,20 +148,20 @@ public class PersistentMessageFinderTest extends MockedBookKeeperTestCase {
 
         CompletableFuture<Void> future = findMessage(result, c1, timestamp);
         future.get();
-        assertEquals(result.exception, null);
-        assertTrue(result.position != null);
+        assertNull(result.exception);
+        assertNotNull(result.position);
         assertEquals(result.position, newPosition);
 
         result.reset();
         future = findMessage(result, c1, beginTimestamp);
         future.get();
-        assertEquals(result.exception, null);
-        assertEquals(result.position, null);
+        assertNull(result.exception);
+        assertEquals(result.position, c1.getFirstPosition());
 
         result.reset();
         future = findMessage(result, c1, endTimestamp);
         future.get();
-        assertEquals(result.exception, null);
+        assertNull(result.exception);
         assertNotEquals(result.position, null);
         assertEquals(result.position, lastPosition);
 

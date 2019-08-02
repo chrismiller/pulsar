@@ -18,17 +18,16 @@
  */
 package org.apache.pulsar.common.functions;
 
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import lombok.*;
 
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@EqualsAndHashCode
 public class ConsumerConfig {
     private String schemaType;
     private String serdeClassName;
     private boolean isRegexPattern;
+    private Integer receiverQueueSize;
 }

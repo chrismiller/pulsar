@@ -18,6 +18,12 @@
  */
 package org.apache.flink.streaming.connectors.pulsar;
 
+import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkState;
+
+import java.util.Arrays;
+
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
@@ -27,22 +33,17 @@ import org.apache.flink.streaming.connectors.pulsar.partitioner.PulsarKeyExtract
 import org.apache.flink.table.sinks.AppendStreamTableSink;
 import org.apache.flink.table.sinks.TableSink;
 import org.apache.flink.types.Row;
-import org.apache.pulsar.client.api.ProducerConfiguration;
-
-import java.util.Arrays;
-
-import static org.apache.flink.util.Preconditions.checkArgument;
-import static org.apache.flink.util.Preconditions.checkNotNull;
-import static org.apache.flink.util.Preconditions.checkState;
+import org.apache.pulsar.client.api.Authentication;
+import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
+import org.apache.pulsar.client.impl.conf.ProducerConfigurationData;
 
 /**
  * An append-only table sink to emit a streaming table as a Pulsar stream.
  */
 public abstract class PulsarTableSink implements AppendStreamTableSink<Row> {
 
-    protected final String serviceUrl;
-    protected final String topic;
-    protected final ProducerConfiguration producerConf;
+    protected ClientConfigurationData clientConfigurationData = new ClientConfigurationData();
+    protected ProducerConfigurationData producerConfigurationData = new ProducerConfigurationData();
     protected SerializationSchema<Row> serializationSchema;
     protected PulsarKeyExtractor<Row> keyExtractor;
     protected String[] fieldNames;
@@ -52,11 +53,22 @@ public abstract class PulsarTableSink implements AppendStreamTableSink<Row> {
     public PulsarTableSink(
             String serviceUrl,
             String topic,
-            ProducerConfiguration producerConf,
+            Authentication authentication,
             String routingKeyFieldName) {
-        this.serviceUrl = checkNotNull(serviceUrl, "Service url not set");
-        this.topic = checkNotNull(topic, "Topic is null");
-        this.producerConf = checkNotNull(producerConf, "Producer configuration not set");
+        checkNotNull(serviceUrl, "Service url not set");
+        checkNotNull(topic, "Topic is null");
+        this.clientConfigurationData.setServiceUrl(serviceUrl);
+        this.clientConfigurationData.setAuthentication(authentication);
+        this.producerConfigurationData.setTopicName(topic);
+        this.routingKeyFieldName = routingKeyFieldName;
+    }
+
+    public PulsarTableSink(
+            ClientConfigurationData clientConfigurationData,
+            ProducerConfigurationData producerConfigurationData,
+            String routingKeyFieldName) {
+        this.clientConfigurationData = checkNotNull(clientConfigurationData, "client config is null");
+        this.producerConfigurationData = checkNotNull(producerConfigurationData, "producer config is null");
         this.routingKeyFieldName = routingKeyFieldName;
     }
 
@@ -79,12 +91,11 @@ public abstract class PulsarTableSink implements AppendStreamTableSink<Row> {
      * Returns the low-level producer.
      */
     protected FlinkPulsarProducer<Row> createFlinkPulsarProducer() {
-        return new FlinkPulsarProducer<Row>(
-                serviceUrl,
-                topic,
-                serializationSchema,
-                producerConf,
-                keyExtractor);
+        return new FlinkPulsarProducer<>(
+            clientConfigurationData,
+            producerConfigurationData,
+            serializationSchema,
+            keyExtractor);
     }
 
     @Override

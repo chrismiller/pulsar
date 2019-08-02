@@ -19,6 +19,7 @@
 #ifndef PULSAR_CLIENT_HPP_
 #define PULSAR_CLIENT_HPP_
 
+#include <pulsar/defines.h>
 #include <pulsar/Consumer.h>
 #include <pulsar/Producer.h>
 #include <pulsar/Reader.h>
@@ -26,22 +27,21 @@
 #include <pulsar/Message.h>
 #include <pulsar/MessageBuilder.h>
 #include <pulsar/ClientConfiguration.h>
+#include <pulsar/Schema.h>
 #include <string>
 
-#pragma GCC visibility push(default)
-
 namespace pulsar {
-typedef boost::function<void(Result, Producer)> CreateProducerCallback;
-typedef boost::function<void(Result, Consumer)> SubscribeCallback;
-typedef boost::function<void(Result, Reader)> ReaderCallback;
-typedef boost::function<void(Result, const std::vector<std::string>&)> GetPartitionsCallback;
-typedef boost::function<void(Result)> CloseCallback;
+typedef std::function<void(Result, Producer)> CreateProducerCallback;
+typedef std::function<void(Result, Consumer)> SubscribeCallback;
+typedef std::function<void(Result, Reader)> ReaderCallback;
+typedef std::function<void(Result, const std::vector<std::string>&)> GetPartitionsCallback;
+typedef std::function<void(Result)> CloseCallback;
 
 class ClientImpl;
 class PulsarFriend;
 class PulsarWrapper;
 
-class Client {
+class PULSAR_PUBLIC Client {
    public:
     /**
      * Create a Pulsar client object connecting to the specified cluster address and using the default
@@ -205,14 +205,12 @@ class Client {
    private:
     Client(const std::string& serviceUrl, const ClientConfiguration& clientConfiguration,
            bool poolConnections);
-    Client(const boost::shared_ptr<ClientImpl>);
+    Client(const std::shared_ptr<ClientImpl>);
 
     friend class PulsarFriend;
     friend class PulsarWrapper;
-    boost::shared_ptr<ClientImpl> impl_;
+    std::shared_ptr<ClientImpl> impl_;
 };
 }  // namespace pulsar
-
-#pragma GCC visibility pop
 
 #endif /* PULSAR_CLIENT_HPP_ */

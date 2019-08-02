@@ -18,6 +18,8 @@
  */
 package org.apache.pulsar.client.admin.internal;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import javax.ws.rs.client.Entity;
 import javax.ws.rs.client.WebTarget;
 import org.apache.pulsar.client.admin.PulsarAdminException;
@@ -25,17 +27,23 @@ import org.apache.pulsar.client.admin.Schemas;
 import org.apache.pulsar.client.api.Authentication;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.ErrorData;
-import org.apache.pulsar.common.schema.DeleteSchemaResponse;
-import org.apache.pulsar.common.schema.GetSchemaResponse;
-import org.apache.pulsar.common.schema.PostSchemaPayload;
+import org.apache.pulsar.common.protocol.schema.DeleteSchemaResponse;
+import org.apache.pulsar.common.protocol.schema.GetAllVersionsSchemaResponse;
+import org.apache.pulsar.common.protocol.schema.GetSchemaResponse;
+import org.apache.pulsar.common.protocol.schema.IsCompatibilityResponse;
+import org.apache.pulsar.common.protocol.schema.LongSchemaVersionResponse;
+import org.apache.pulsar.common.protocol.schema.PostSchemaPayload;
 import org.apache.pulsar.common.schema.SchemaInfo;
+
+import java.util.List;
+import java.util.stream.Collectors;
 
 public class SchemasImpl extends BaseResource implements Schemas {
 
     private final WebTarget target;
 
-    public SchemasImpl(WebTarget web, Authentication auth) {
-        super(auth);
+    public SchemasImpl(WebTarget web, Authentication auth, long readTimeoutMs) {
+        super(auth, readTimeoutMs);
         this.target = web.path("/admin/v2/schemas");
     }
 
@@ -44,12 +52,7 @@ public class SchemasImpl extends BaseResource implements Schemas {
         try {
             TopicName tn = TopicName.get(topic);
             GetSchemaResponse response = request(schemaPath(tn)).get(GetSchemaResponse.class);
-            SchemaInfo info = new SchemaInfo();
-            info.setSchema(response.getData().getBytes());
-            info.setType(response.getType());
-            info.setProperties(response.getProperties());
-            info.setName(tn.getLocalName());
-            return info;
+            return convertGetSchemaResponseToSchemaInfo(tn, response);
         } catch (Exception e) {
             throw getApiException(e);
         }
@@ -59,13 +62,9 @@ public class SchemasImpl extends BaseResource implements Schemas {
     public SchemaInfo getSchemaInfo(String topic, long version) throws PulsarAdminException {
         try {
             TopicName tn = TopicName.get(topic);
-            GetSchemaResponse response = request(schemaPath(tn).path(Long.toString(version))).get(GetSchemaResponse.class);
-            SchemaInfo info = new SchemaInfo();
-            info.setSchema(response.getData().getBytes());
-            info.setType(response.getType());
-            info.setProperties(response.getProperties());
-            info.setName(tn.getLocalName());
-            return info;
+            GetSchemaResponse response = request(schemaPath(tn).path(Long.toString(version)))
+                .get(GetSchemaResponse.class);
+            return convertGetSchemaResponseToSchemaInfo(tn, response);
         } catch (Exception e) {
             throw getApiException(e);
         }
@@ -82,11 +81,71 @@ public class SchemasImpl extends BaseResource implements Schemas {
     }
 
     @Override
+    public void createSchema(String topic, SchemaInfo schemaInfo) throws PulsarAdminException {
+
+        createSchema(topic, convertSchemaInfoToPostSchemaPayload(schemaInfo));
+    }
+
+    @Override
     public void createSchema(String topic, PostSchemaPayload payload) throws PulsarAdminException {
         try {
             TopicName tn = TopicName.get(topic);
             request(schemaPath(tn))
                 .post(Entity.json(payload), ErrorData.class);
+        } catch (Exception e) {
+            throw getApiException(e);
+        }
+    }
+
+    @Override
+    public IsCompatibilityResponse testCompatibility(String topic, PostSchemaPayload payload) throws PulsarAdminException {
+        try {
+            TopicName tn = TopicName.get(topic);
+            return request(compatibilityPath(tn)).post(Entity.json(payload), IsCompatibilityResponse.class);
+        } catch (Exception e) {
+            throw getApiException(e);
+        }
+    }
+
+    @Override
+    public Long getVersionBySchema(String topic, PostSchemaPayload payload) throws PulsarAdminException {
+        try {
+            return request(versionPath(TopicName.get(topic))).post(Entity.json(payload), LongSchemaVersionResponse.class).getVersion();
+        } catch (Exception e) {
+            throw getApiException(e);
+        }
+    }
+
+    @Override
+    public IsCompatibilityResponse testCompatibility(String topic, SchemaInfo schemaInfo) throws PulsarAdminException {
+        try {
+            return request(compatibilityPath(TopicName.get(topic)))
+                    .post(Entity.json(convertSchemaInfoToPostSchemaPayload(schemaInfo)), IsCompatibilityResponse.class);
+        } catch (Exception e) {
+            throw getApiException(e);
+        }
+    }
+
+    @Override
+    public Long getVersionBySchema(String topic, SchemaInfo schemaInfo) throws PulsarAdminException {
+        try {
+            return request(versionPath(TopicName.get(topic)))
+                    .post(Entity.json(convertSchemaInfoToPostSchemaPayload(schemaInfo)), LongSchemaVersionResponse.class).getVersion();
+        } catch (Exception e) {
+            throw getApiException(e);
+        }
+    }
+
+    @Override
+    public List<SchemaInfo> getAllSchemas(String topic) throws PulsarAdminException {
+        try {
+            TopicName topicName = TopicName.get(topic);
+            return request(schemasPath(TopicName.get(topic)))
+                    .get(GetAllVersionsSchemaResponse.class)
+                    .getGetSchemaResponses().stream()
+                    .map(getSchemaResponse -> convertGetSchemaResponseToSchemaInfo(topicName, getSchemaResponse))
+                    .collect(Collectors.toList());
+
         } catch (Exception e) {
             throw getApiException(e);
         }
@@ -98,5 +157,60 @@ public class SchemasImpl extends BaseResource implements Schemas {
             .path(topicName.getNamespacePortion())
             .path(topicName.getEncodedLocalName())
             .path("schema");
+    }
+
+    private WebTarget versionPath(TopicName topicName) {
+        return target
+                .path(topicName.getTenant())
+                .path(topicName.getNamespacePortion())
+                .path(topicName.getEncodedLocalName())
+                .path("version");
+    }
+
+    private WebTarget schemasPath(TopicName topicName) {
+        return target
+                .path(topicName.getTenant())
+                .path(topicName.getNamespacePortion())
+                .path(topicName.getEncodedLocalName())
+                .path("schemas");
+    }
+
+    private WebTarget compatibilityPath(TopicName topicName) {
+        return target
+                .path(topicName.getTenant())
+                .path(topicName.getNamespacePortion())
+                .path(topicName.getEncodedLocalName())
+                .path("compatibility");
+    }
+
+    // the util function converts `GetSchemaResponse` to `SchemaInfo`
+    static SchemaInfo convertGetSchemaResponseToSchemaInfo(TopicName tn,
+                                                           GetSchemaResponse response) {
+        SchemaInfo info = new SchemaInfo();
+        info.setSchema(response.getData().getBytes(UTF_8));
+        info.setType(response.getType());
+        info.setProperties(response.getProperties());
+        info.setName(tn.getLocalName());
+        return info;
+    }
+
+
+    // the util function exists for backward compatibility concern
+    static String convertSchemaDataToStringLegacy(byte[] schemaData) {
+        if (null == schemaData) {
+            return "";
+        }
+
+        return new String(schemaData, UTF_8);
+    }
+
+    static PostSchemaPayload convertSchemaInfoToPostSchemaPayload(SchemaInfo schemaInfo) {
+        PostSchemaPayload payload = new PostSchemaPayload();
+        payload.setType(schemaInfo.getType().name());
+        payload.setProperties(schemaInfo.getProperties());
+        // for backward compatibility concern, we convert `bytes` to `string`
+        // we can consider fixing it in a new version of rest endpoint
+        payload.setSchema(convertSchemaDataToStringLegacy(schemaInfo.getSchema()));
+        return payload;
     }
 }

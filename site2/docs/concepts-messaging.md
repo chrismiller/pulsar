@@ -40,10 +40,12 @@ Producers can send messages to brokers either synchronously (sync) or asynchrono
 
 ### Compression
 
-Messages published by producers can be compressed during transportation in order to save bandwidth. Pulsar currently supports two types of compression:
+Messages published by producers can be compressed during transportation in order to save bandwidth. Pulsar currently supports the following types of compression:
 
 * [LZ4](https://github.com/lz4/lz4)
 * [ZLIB](https://zlib.net/)
+* [ZSTD](https://facebook.github.io/zstd/)
+* [SNAPPY](https://google.github.io/snappy/)
 
 ### Batching
 
@@ -62,18 +64,59 @@ Messages can be received from [brokers](reference-terminology.md#broker) either 
 | Sync receive  | A sync receive will be blocked until a message is available.                                                                                                                                                  |
 | Async receive | An async receive will return immediately with a future value---a [`CompletableFuture`](http://www.baeldung.com/java-completablefuture) in Java, for example---that completes once a new message is available. |
 
+### Listeners
+
+Client libraries provide listener implementation for consumers. For example, the [Java client](client-libraries-java.md) provides a {@inject: javadoc:MesssageListener:/client/org/apache/pulsar/client/api/MessageListener} interface. In this interface, the `received` method is called whenever a new message is received.
+
 ### Acknowledgement
 
-When a consumer has successfully processed a message, it needs to send an acknowledgement to the broker so that the broker can discard the message (otherwise it [stores](concepts-architecture-overview.md#persistent-storage) the message).
+When a consumer has consumed a message successfully, the consumer sends an acknowledgement request to the broker, so that the broker will discard the message. Otherwise, it [stores](concepts-architecture-overview.md#persistent-storage) the message.
 
 Messages can be acknowledged either one by one or cumulatively. With cumulative acknowledgement, the consumer only needs to acknowledge the last message it received. All messages in the stream up to (and including) the provided message will not be re-delivered to that consumer.
 
 
 > Cumulative acknowledgement cannot be used with [shared subscription mode](#subscription-modes), because shared mode involves multiple consumers having access to the same subscription.
 
-### Listeners
+In the shared subscription mode, messages can be acknowledged individually.
 
-Client libraries can provide their own listener implementations for consumers. The [Java client](client-libraries-java.md), for example, provides a {@inject: javadoc:MesssageListener:/client/org/apache/pulsar/client/api/MessageListener} interface. In this interface, the `received` method is called whenever a new message is received.
+### Negative acknowledgement
+
+When a consumer does not consume a message successfully at a time, and wants to consume the message again, the consumer can send a negative acknowledgement to the broker, and then the broker will redeliver the message.
+
+Messages can be negatively acknowledged one by one or cumulatively, which depends on the consumption subscription mode.
+
+In the exclusive and failover subscription modes, consumers only negatively acknowledge the last message they have received.
+
+In the shared and Key_Shared subscription modes, you can negatively acknowledge messages individually.
+
+### Acknowledgement timeout
+
+When a message is not consumed successfully, and you want to trigger the broker to redeliver the message automatically, you can adopt the unacknowledged message automatic re-delivery mechanism. Client will track the unacknowledged messages within the entire `acktimeout` time range, and send a `redeliver unacknowledged messages` request to the broker automatically when the acknowledgement timeout is specified.
+
+> Note    
+> Use negative acknowledgement prior to acknowledgement timeout. Negative acknowledgement controls re-delivery of individual messages with more precise, and avoids invalid redeliveries when the message processing time exceeds the acknowledgement timeout.
+
+### Dead letter topic
+
+Dead letter topic enables you to consume new messages when some messages cannot be consumed successfully by a consumer. In this mechanism, messages that are failed to be consumed are stored in a separate topic, which is called dead letter topic. You can decide how to handle messages in the dead letter topic.
+
+The following example shows how to enable dead letter topic in Java client.
+
+```java
+Consumer<byte[]> consumer = pulsarClient.newConsumer(Schema.BYTES)
+              .topic(topic)
+              .subscriptionName("my-subscription")
+              .subscriptionType(SubscriptionType.Shared)
+              .deadLetterPolicy(DeadLetterPolicy.builder()
+                    .maxRedeliverCount(maxRedeliveryCount)
+                    .build())
+              .subscribe();
+                
+```
+Dead letter topic depends on message re-delivery. You need to confirm message re-delivery method: negative acknowledgement or acknowledgement timeout. Use negative acknowledgement prior to acknowledgement timeout. 
+
+> Note    
+> Currently, dead letter topic is enabled only in the shared subscription mode.
 
 ## Topics
 
@@ -115,6 +158,16 @@ In the diagram above, only **Consumer-A** is allowed to consume messages.
 
 ![Exclusive subscriptions](assets/pulsar-exclusive-subscriptions.png)
 
+### Failover
+
+In *failover* mode, multiple consumers can attach to the same subscription. The consumers will be lexically sorted by the consumer's name and the first consumer will initially be the only one receiving messages. This consumer is called the *master consumer*.
+
+When the master consumer disconnects, all (non-acked and subsequent) messages will be delivered to the next consumer in line.
+
+In the diagram above, Consumer-C-1 is the master consumer while Consumer-C-2 would be the next in line to receive messages if Consumer-C-1 disconnected.
+
+![Failover subscriptions](assets/pulsar-failover-subscriptions.png)
+
 ### Shared
 
 In *shared* or *round robin* mode, multiple consumers can attach to the same subscription. Messages are delivered in a round robin distribution across consumers, and any given message is delivered to only one consumer. When a consumer disconnects, all the messages that were sent to it and not acknowledged will be rescheduled for sending to the remaining consumers.
@@ -128,15 +181,18 @@ In the diagram above, **Consumer-B-1** and **Consumer-B-2** are able to subscrib
 
 ![Shared subscriptions](assets/pulsar-shared-subscriptions.png)
 
-### Failover
+### Key_shared
 
-In *failover* mode, multiple consumers can attach to the same subscription. The consumers will be lexically sorted by the consumer's name and the first consumer will initially be the only one receiving messages. This consumer is called the *master consumer*.
+In *Key_Shared* mode, multiple consumers can attach to the same subscription. Messages are delivered in a distribution across consumers and message with same key or same ordering key are delivered to only one consumer. No matter how many times the message is re-delivered, it is delivered to the same consumer. When a consumer connected or disconnected will cause served consumer change for some key of message.
 
-When the master consumer disconnects, all (non-acked and subsequent) messages will be delivered to the next consumer in line.
+> #### Limitations of Key_Shared mode
+> There are two important things to be aware of when using Key_Shared mode:
+> * You need to specify a key or orderingKey for messages
+> * You cannot use cumulative acknowledgment with Key_Shared mode.
 
-In the diagram above, Consumer-C-1 is the master consumer while Consumer-C-2 would be the next in line to receive messages if Consumer-C-1 disconnected.
+![Key_Shared subscriptions](assets/pulsar-key-shared-subscriptions.png)
 
-![Failover subscriptions](assets/pulsar-failover-subscriptions.png)
+**Key_Shared subscription is a beta feature. You can disable it at broker.config.**
 
 ## Multi-topic subscriptions
 
@@ -164,11 +220,17 @@ PulsarClient pulsarClient = // Instantiate Pulsar client object
 
 // Subscribe to all topics in a namespace
 Pattern allTopicsInNamespace = Pattern.compile("persistent://public/default/.*");
-Consumer allTopicsConsumer = pulsarClient.subscribe(allTopicsInNamespace, "subscription-1");
+Consumer<byte[]> allTopicsConsumer = pulsarClient.newConsumer()
+                .topicsPattern(allTopicsInNamespace)
+                .subscriptionName("subscription-1")
+                .subscribe();
 
 // Subscribe to a subsets of topics in a namespace, based on regex
 Pattern someTopicsInNamespace = Pattern.compile("persistent://public/default/foo.*");
-Consumer someTopicsConsumer = pulsarClient.subscribe(someTopicsInNamespace, "subscription-1");
+Consumer<byte[]> someTopicsConsumer = pulsarClient.newConsumer()
+                .topicsPattern(someTopicsInNamespace)
+                .subscriptionName("subscription-1")
+                .subscribe();
 ```
 
 For code examples, see:
@@ -199,15 +261,32 @@ Partitioned topics need to be explicitly created via the [admin API](admin-api-o
 
 When publishing to partitioned topics, you must specify a *routing mode*. The routing mode determines which partition---that is, which internal topic---each message should be published to.
 
-There are three routing modes available by default:
+There are three {@inject: javadoc:MessageRoutingMode:/client/org/apache/pulsar/client/api/MessageRoutingMode} available:
 
-Mode | Description | Ordering guarantee
-:----|:------------|:------------------
-Key hash | If a key property has been specified on the message, the partitioned producer will hash the key and assign it to a particular partition. | Per-key-bucket ordering
-Single default partition | If no key is provided, each producer's message will be routed to a dedicated partition, initially random selected | Per-producer ordering
-Round robin distribution | If no key is provided, all messages will be routed to different partitions in round-robin fashion to achieve maximum throughput. | None
+Mode     | Description 
+:--------|:------------
+`RoundRobinPartition` | If no key is provided, the producer will publish messages across all partitions in round-robin fashion to achieve maximum throughput. Please note that round-robin is not done per individual message but rather it's set to the same boundary of batching delay, to ensure batching is effective. While if a key is specified on the message, the partitioned producer will hash the key and assign message to a particular partition. This is the default mode. 
+`SinglePartition`     | If no key is provided, the producer will randomly pick one single partition and publish all the messages into that partition. While if a key is specified on the message, the partitioned producer will hash the key and assign message to a particular partition.
+`CustomPartition`     | Use custom message router implementation that will be called to determine the partition for a particular message. User can create a custom routing mode by using the [Java client](client-libraries-java.md) and implementing the {@inject: javadoc:MessageRouter:/client/org/apache/pulsar/client/api/MessageRouter} interface.
 
-In addition to these default modes, you can also create a custom routing mode if you're using the [Java client](client-libraries-java.md) by implementing the {@inject: javadoc:MessageRouter:/client/org/apache/pulsar/client/api/MessageRouter} interface.
+### Ordering guarantee
+
+The ordering of messages is related to MessageRoutingMode and Message Key. Usually, user would want an ordering of Per-key-partition guarantee.
+
+If there is a key attached to message, the messages will be routed to corresponding partitions based on the hashing scheme specified by {@inject: javadoc:HashingScheme:/client/org/apache/pulsar/client/api/HashingScheme} in {@inject: javadoc:ProducerBuilder:/client/org/apache/pulsar/client/api/ProducerBuilder}, when using either `SinglePartition` or `RoundRobinPartition` mode.
+
+Ordering guarantee | Description | Routing Mode and Key
+:------------------|:------------|:------------
+Per-key-partition  | All the messages with the same key will be in order and be placed in same partition. | Use either `SinglePartition` or `RoundRobinPartition` mode, and Key is provided by each message.
+Per-producer       | All the messages from the same producer will be in order. | Use `SinglePartition` mode, and no Key is provided for each message.
+
+### Hashing scheme
+
+{@inject: javadoc:HashingScheme:/client/org/apache/pulsar/client/api/HashingScheme} is an enum that represent sets of standard hashing functions available when choosing the partition to use for a particular message.
+
+There are 2 types of standard hashing functions available: `JavaStringHash` and `Murmur3_32Hash`. 
+The default hashing function for producer is `JavaStringHash`.
+Please pay attention that `JavaStringHash` is not useful when producers can be from different multiple language clients, under this use case, it is recommended to use `Murmur3_32Hash`.
 
 
 
@@ -243,17 +322,24 @@ Producers and consumers can connect to non-persistent topics in the same way as 
 Here's an example [Java consumer](client-libraries-java.md#consumers) for a non-persistent topic:
 
 ```java
-PulsarClient client = PulsarClient.create("pulsar://localhost:6650");
+PulsarClient client = PulsarClient.builder()
+        .serviceUrl("pulsar://localhost:6650")
+        .build();
 String npTopic = "non-persistent://public/default/my-topic";
 String subscriptionName = "my-subscription-name";
 
-Consumer consumer = client.subscribe(npTopic, subscriptionName);
+Consumer<byte[]> consumer = client.newConsumer()
+        .topic(npTopic)
+        .subscriptionName(subscriptionName)
+        .subscribe();
 ```
 
 Here's an example [Java producer](client-libraries-java.md#producer) for the same non-persistent topic:
 
 ```java
-Producer producer = client.createProducer(npTopic);
+Producer<byte[]> producer = client.newProducer()
+                .topic(npTopic)
+                .create();
 ```
 
 ## Message retention and expiry

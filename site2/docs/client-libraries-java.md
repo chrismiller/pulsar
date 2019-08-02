@@ -4,7 +4,7 @@ title: The Pulsar Java client
 sidebar_label: Java
 ---
 
-The Pulsar Java client can be used both to create Java producers, consumers, and [readers](#readers) of messages and to perform [administrative tasks](admin-api-overview.md). The current version of the Java client is **{{pulsar:version}}**.
+The Pulsar Java client can be used both to create Java producers, consumers, and [readers](#reader-interface) of messages and to perform [administrative tasks](admin-api-overview.md). The current version of the Java client is **{{pulsar:version}}**.
 
 Javadoc for the Pulsar client is divided up into two domains, by package:
 
@@ -57,6 +57,11 @@ Pulsar protocol URLs are assigned to specific clusters, use the `pulsar` scheme 
 pulsar://localhost:6650
 ```
 
+If you have more than one broker, the URL may look like this:
+```http
+pulsar://localhost:6550,localhost:6651,localhost:6652
+```
+
 A URL for a production Pulsar cluster may look something like this:
 
 ```http
@@ -76,6 +81,13 @@ You can instantiate a {@inject: javadoc:PulsarClient:/client/org/apache/pulsar/c
 ```java
 PulsarClient client = PulsarClient.builder()
         .serviceUrl("pulsar://localhost:6650")
+        .build();
+```
+
+If you have multiple brokers, you can initiate a PulsarClient like this:
+```java
+PulsarClient client = PulsarClient.builder()
+        .serviceUrl("pulsar://localhost:6650,localhost:6651,localhost:6652")
         .build();
 ```
 
@@ -125,11 +137,10 @@ stringProducer.send("My message");
 >        return ex;
 >    });
 > ```
-' %}
 
 ### Configuring producers
 
-If you instantiate a `Producer` object specifying only a topic name, as in the example above, the producer will use the default configuration. To use a non-default configuration, there's a variety of configurable parameters that you can set. For a full listing, see the Javadoc for the {@inject javadoc:ProducerBuilder:/client/org/apache/pulsar/client/api/ProducerBuilder} class. Here's an example:
+If you instantiate a `Producer` object specifying only a topic name, as in the example above, the producer will use the default configuration. To use a non-default configuration, there's a variety of configurable parameters that you can set. For a full listing, see the Javadoc for the {@inject: javadoc:ProducerBuilder:/client/org/apache/pulsar/client/api/ProducerBuilder} class. Here's an example:
 
 ```java
 Producer<byte[]> producer = client.newProducer()
@@ -156,7 +167,7 @@ producer.sendAsync("my-async-message".getBytes()).thenAccept(msgId -> {
 });
 ```
 
-As you can see from the example above, async send operations return a {@inject javadoc:MessageId:/client/org/apache/pulsar/client/api/MessageId} wrapped in a [`CompletableFuture`](http://www.baeldung.com/java-completablefuture).
+As you can see from the example above, async send operations return a {@inject: javadoc:MessageId:/client/org/apache/pulsar/client/api/MessageId} wrapped in a [`CompletableFuture`](http://www.baeldung.com/java-completablefuture).
 
 ### Configuring messages
 
@@ -187,18 +198,25 @@ Consumer consumer = client.newConsumer()
         .subscribe();
 ```
 
-The `subscribe` method will automatically subscribe the consumer to the specified topic and subscription. One way to make the consumer listen on the topic is to set up a `while` loop. In this example loop, the consumer listens for messages, prints the contents of any message that's received, and then [acknowledges](reference-terminology.md#acknowledgment-ack) that the message has been processed:
+The `subscribe` method will automatically subscribe the consumer to the specified topic and subscription. One way to make the consumer listen on the topic is to set up a `while` loop. In this example loop, the consumer listens for messages, prints the contents of any message that's received, and then [acknowledges](reference-terminology.md#acknowledgment-ack) that the message has been processed. If the processing logic fails, we use [negative acknowledgement](reference-terminology.md#acknowledgment-ack)
+to have the message redelivered at a later point in time.
 
 ```java
-do {
+while (true) {
   // Wait for a message
   Message msg = consumer.receive();
 
-  System.out.printf("Message received: %s", new String(msg.getData()));
+  try {
+      // Do something with the message
+      System.out.printf("Message received: %s", new String(msg.getData()));
 
-  // Acknowledge the message so that it can be deleted by the message broker
-  consumer.acknowledge(msg);
-} while (true);
+      // Acknowledge the message so that it can be deleted by the message broker
+      consumer.acknowledge(msg);
+  } catch (Exception e) {
+      // Message failed to process, redeliver later
+      consumer.negativeAcknowledge(msg);
+  }
+}
 ```
 
 ### Configuring consumers
@@ -226,7 +244,7 @@ Here's an example:
 CompletableFuture<Message> asyncMessage = consumer.receiveAsync();
 ```
 
-Async receive operations return a {@inject javadoc:Message:/client/org/apache/pulsar/client/api/Message} wrapped inside of a [`CompletableFuture`](http://www.baeldung.com/java-completablefuture).
+Async receive operations return a {@inject: javadoc:Message:/client/org/apache/pulsar/client/api/Message} wrapped inside of a [`CompletableFuture`](http://www.baeldung.com/java-completablefuture).
 
 ### Multi-topic subscriptions
 
@@ -288,21 +306,200 @@ Pattern allTopicsInNamespace = Pattern.compile("persistent://public/default.*");
 consumerBuilder
         .topics(topics)
         .subscribeAsync()
-        .thenAccept(consumer -> {
-            do {
-                try {
-                    Message msg = consumer.receive();
-                    // Do something with the received message
-                } catch (PulsarClientException e) {
-                    e.printStackTrace();
-                }
-            } while (true);
-        });
+        .thenAccept(this::receiveMessageFromConsumer);
+
+private void receiveMessageFromConsumer(Consumer consumer) {
+    consumer.receiveAsync().thenAccept(message -> {
+                // Do something with the received message
+                receiveMessageFromConsumer(consumer);
+            });
+}
 ```
 
-## Reader interface {#readers}
+### Subscription modes
 
-With the [reader interface](concepts-clients.md#reader-interface), Pulsar clients can "manually position" themselves within a topic, reading all messages from a specified message onward. The Pulsar API for Java enables you to create  {@inject: javadoc:Reader:/client/org/apache/pulsar/client/api/Reader} objects by specifying a topic, a {@inject: javadoc:MessageId:/client/org/apache/pulsar/client/api/MessageId}, and {@inject javadoc:ReaderConfiguration:/client/org/apache/pulsar/client/api/ReaderConfiguration}.
+Pulsar has various [subscription modes](concepts-messaging#subscription-modes) to match different scenarios. A topic can have multiple subscriptions with different subscription modes. However, a subscription can only have one subscription mode at a time.
+
+A subscription is identified with the subscription name, and a subscription name can specify only one subscription mode at a time. You can change the subscription mode, yet you have to let all existing consumers of this subscription offline first.
+
+Different subscription modes have different message distribution modes. This section describes the differences of subscription modes and how to use them.
+
+In order to better describe their differences, assuming you have a topic named "my-topic", and the producer has published 10 messages.
+
+```java
+Producer<String> producer = client.newProducer(Schema.STRING)
+        .topic("my-topic")
+        .enableBatch(false)
+        .create();
+// 3 messages with "key-1", 3 messages with "key-2", 2 messages with "key-3" and 2 messages with "key-4"
+producer.newMessage().key("key-1").value("message-1-1").send();
+producer.newMessage().key("key-1").value("message-1-2").send();
+producer.newMessage().key("key-1").value("message-1-3").send();
+producer.newMessage().key("key-2").value("message-2-1").send();
+producer.newMessage().key("key-2").value("message-2-2").send();
+producer.newMessage().key("key-2").value("message-2-3").send();
+producer.newMessage().key("key-3").value("message-3-1").send();
+producer.newMessage().key("key-3").value("message-3-2").send();
+producer.newMessage().key("key-4").value("message-4-1").send();
+producer.newMessage().key("key-4").value("message-4-2").send();
+```
+
+#### Exclusive
+
+Create a new consumer and subscribe with the `Exclusive` subscription mode.
+
+```java
+Consumer consumer = client.newConsumer()
+        .topic("my-topic")
+        .subscriptionName("my-subscription")
+        .subscriptionType(SubscriptionType.Exclusive)
+        .subscribe()
+```
+
+Only the first consumer is allowed to the subscription, other consumers receive an error. The first consumer receives all 10 messages, and the consuming order is the same as the producing order.
+
+> Note:
+>
+> If topic is a partitioned topic, the first consumer subscribes to all partitioned topics, other consumers are not assigned with partitions and receive an error. 
+
+#### Failover
+
+Create new consumers and subscribe with the`Failover` subscription mode.
+
+```java
+Consumer consumer1 = client.newConsumer()
+        .topic("my-topic")
+        .subscriptionName("my-subscription")
+        .subscriptionType(SubscriptionType.Failover)
+        .subscribe()
+Consumer consumer2 = client.newConsumer()
+        .topic("my-topic")
+        .subscriptionName("my-subscription")
+        .subscriptionType(SubscriptionType.Failover)
+        .subscribe()
+//conumser1 is the active consumer, consumer2 is the standby consumer.
+//consumer1 receives 5 messages and then crashes, consumer2 takes over as an  active consumer.
+
+  
+```
+
+Multiple consumers can attach to the same subscription, yet only the first consumer is active, and others are standby. When the active consumer is disconnected, messages will be dispatched to one of standby consumers, and the standby consumer becomes active consumer. 
+
+If the first active consumer receives 5 messages and is disconnected, the standby consumer becomes active consumer. Consumer1 will receive:
+
+```
+("key-1", "message-1-1")
+("key-1", "message-1-2")
+("key-1", "message-1-3")
+("key-2", "message-2-1")
+("key-2", "message-2-2")
+```
+
+consumer2 will receive:
+
+```
+("key-2", "message-2-3")
+("key-3", "message-3-1")
+("key-3", "message-3-2")
+("key-4", "message-4-1")
+("key-4", "message-4-2")
+```
+
+> Note:
+>
+> If a topic is a partitioned topic, each partition only has one active consumer, messages of one partition only distributed to one consumer, messages of multiple partitions are distributed to multiple consumers. 
+
+#### Shared
+
+Create new consumers and subscribe with `Shared` subscription mode:
+
+```java
+Consumer consumer1 = client.newConsumer()
+        .topic("my-topic")
+        .subscriptionName("my-subscription")
+        .subscriptionType(SubscriptionType.Shared)
+        .subscribe()
+  
+Consumer consumer2 = client.newConsumer()
+        .topic("my-topic")
+        .subscriptionName("my-subscription")
+        .subscriptionType(SubscriptionType.Shared)
+        .subscribe()
+//Both consumer1 and consumer 2 is active consumers.
+```
+
+In shared subscription mode, multiple consumers can attach to the same subscription and message are delivered in a round robin distribution across consumers.
+
+If a broker dispatches only one message at a time, consumer1 will receive:
+
+```
+("key-1", "message-1-1")
+("key-1", "message-1-3")
+("key-2", "message-2-2")
+("key-3", "message-3-1")
+("key-4", "message-4-1")
+```
+
+consumer 2 will receive:
+
+```
+("key-1", "message-1-2")
+("key-2", "message-2-1")
+("key-2", "message-2-3")
+("key-3", "message-3-2")
+("key-4", "message-4-2")
+```
+
+`Shared` subscription is different from `Exclusive` and `Failover` subscription modes. `Shared` subscription has better flexibility, but cannot provide order guarantee.
+
+#### Key_shared
+
+This is a new subscription mode since 2.4.0 release, create new consumers and subscribe with `Key_Shared` subscription mode:
+
+```java
+Consumer consumer1 = client.newConsumer()
+        .topic("my-topic")
+        .subscriptionName("my-subscription")
+        .subscriptionType(SubscriptionType.Key_Shared)
+        .subscribe()
+  
+Consumer consumer2 = client.newConsumer()
+        .topic("my-topic")
+        .subscriptionName("my-subscription")
+        .subscriptionType(SubscriptionType.Key_Shared)
+        .subscribe()
+//Both consumer1 and consumer2 are active consumers.
+```
+
+`Key_Shared` subscription is like `Shared` subscription, all consumers can attach to the same subscription. But it is different from `Key_Shared` subscription, messages with the same key are delivered to only one consumer in order. The possible distribution of messages between different consumers(by default we do not know in advance which keys will be assigned to a consumer, but a key will only be assigned to a consumer at the same time. ) .
+
+consumer1 will receive:
+
+```
+("key-1", "message-1-1")
+("key-1", "message-1-2")
+("key-1", "message-1-3")
+("key-3", "message-3-1")
+("key-3", "message-3-2")
+```
+
+consumer 2 will receive:
+
+```
+("key-2", "message-2-1")
+("key-2", "message-2-2")
+("key-2", "message-2-3")
+("key-4", "message-4-1")
+("key-4", "message-4-2")
+```
+
+> Note:
+>
+> If the message key is not specified, messages without key will be dispatched to one consumer in order by default.
+
+## Reader interface
+
+With the [reader interface](concepts-clients.md#reader-interface), Pulsar clients can "manually position" themselves within a topic, reading all messages from a specified message onward. The Pulsar API for Java enables you to create  {@inject: javadoc:Reader:/client/org/apache/pulsar/client/api/Reader} objects by specifying a topic, a {@inject: javadoc:MessageId:/client/org/apache/pulsar/client/api/MessageId}, and {@inject: javadoc:ReaderConfiguration:/client/org/apache/pulsar/client/api/ReaderConfiguration}.
 
 Here's an example:
 
@@ -396,12 +593,28 @@ The following schema formats are currently available for Java:
         .topic("some-string-topic")
         .create();
   ```
-* JSON schemas can be created for POJOs using the `JSONSchema` class. Here's an example:
+
+* JSON schemas can be created for POJOs using `Schema.JSON`. Here's an example:
 
   ```java
-  Schema<MyPojo> pojoSchema = JSONSchema.of(MyPojo.class);
-  Producer<MyPojo> pojoProducer = client.newProducer(pojoSchema)
+  Producer<MyPojo> pojoProducer = client.newProducer(Schema.JSON(MyPojo.class))
         .topic("some-pojo-topic")
+        .create();
+  ```
+
+* Protobuf schemas can be generate using `Schema.PROTOBUF`. The following example shows how to create the Protobuf schema and use it to instantiate a new producer:
+
+  ```java
+  Producer<MyProtobuf> protobufProducer = client.newProducer(Schema.PROTOBUF(MyProtobuf.class))
+        .topic("some-protobuf-topic")
+        .create();
+  ```
+
+* Avro schemas can be defined with the help of `Schema.AVRO`. The next code snippet demonstrates the creation and usage of the Avro schema:
+  
+  ```java
+  Producer<MyAvro> avroProducer = client.newProducer(Schema.AVRO(MyAvro.class))
+        .topic("some-avro-topic")
         .create();
   ```
 

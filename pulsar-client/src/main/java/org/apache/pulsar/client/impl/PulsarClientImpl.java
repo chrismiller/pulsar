@@ -18,10 +18,12 @@
  */
 package org.apache.pulsar.client.impl;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.commons.lang3.StringUtils.isBlank;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
@@ -30,6 +32,7 @@ import io.netty.util.HashedWheelTimer;
 import io.netty.util.Timer;
 import io.netty.util.concurrent.DefaultThreadFactory;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
@@ -45,28 +48,28 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import org.apache.pulsar.client.api.ClientConfiguration;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.ConsumerBuilder;
-import org.apache.pulsar.client.api.ConsumerConfiguration;
-import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.ProducerBuilder;
-import org.apache.pulsar.client.api.ProducerConfiguration;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.ReaderBuilder;
-import org.apache.pulsar.client.api.ReaderConfiguration;
+import org.apache.pulsar.client.api.RegexSubscriptionMode;
 import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.client.api.SubscriptionType;
+import org.apache.pulsar.client.api.schema.SchemaInfoProvider;
+import org.apache.pulsar.client.api.AuthenticationFactory;
+import org.apache.pulsar.client.impl.ConsumerImpl.SubscriptionMode;
 import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
 import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
 import org.apache.pulsar.client.impl.conf.ProducerConfigurationData;
 import org.apache.pulsar.client.impl.conf.ReaderConfigurationData;
 import org.apache.pulsar.client.impl.schema.AutoConsumeSchema;
 import org.apache.pulsar.client.impl.schema.AutoProduceBytesSchema;
-import org.apache.pulsar.client.impl.schema.generic.GenericSchema;
+import org.apache.pulsar.client.impl.schema.generic.MultiVersionSchemaInfoProvider;
 import org.apache.pulsar.client.util.ExecutorProvider;
 import org.apache.pulsar.common.api.proto.PulsarApi.CommandGetTopicsOfNamespace.Mode;
 import org.apache.pulsar.common.naming.NamespaceName;
@@ -74,13 +77,11 @@ import org.apache.pulsar.common.naming.TopicDomain;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
 import org.apache.pulsar.common.schema.SchemaInfo;
-import org.apache.pulsar.common.schema.SchemaType;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.common.util.netty.EventLoopUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-@SuppressWarnings("deprecation")
 public class PulsarClientImpl implements PulsarClient {
 
     private static final Logger log = LoggerFactory.getLogger(PulsarClientImpl.class);
@@ -105,22 +106,16 @@ public class PulsarClientImpl implements PulsarClient {
 
     private final EventLoopGroup eventLoopGroup;
 
-    @Deprecated
-    public PulsarClientImpl(String serviceUrl, ClientConfiguration conf) throws PulsarClientException {
-        this(conf.setServiceUrl(serviceUrl).getConfigurationData().clone());
-    }
+    private final LoadingCache<String, SchemaInfoProvider> schemaProviderLoadingCache = CacheBuilder.newBuilder().maximumSize(100000)
+                    .expireAfterAccess(30, TimeUnit.MINUTES).build(new CacheLoader<String, SchemaInfoProvider>() {
 
-    @Deprecated
-    public PulsarClientImpl(String serviceUrl, ClientConfiguration conf, EventLoopGroup eventLoopGroup)
-            throws PulsarClientException {
-        this(conf.setServiceUrl(serviceUrl).getConfigurationData().clone(), eventLoopGroup);
-    }
+                @Override
+                public SchemaInfoProvider load(String topicName) {
+                    return newSchemaProvider(topicName);
+                }
+            });
 
-    @Deprecated
-    public PulsarClientImpl(String serviceUrl, ClientConfiguration conf, EventLoopGroup eventLoopGroup,
-            ConnectionPool cnxPool) throws PulsarClientException {
-        this(conf.setServiceUrl(serviceUrl).getConfigurationData().clone(), eventLoopGroup, cnxPool);
-    }
+    private final Clock clientClock;
 
     public PulsarClientImpl(ClientConfigurationData conf) throws PulsarClientException {
         this(conf, getEventLoopGroup(conf));
@@ -136,7 +131,9 @@ public class PulsarClientImpl implements PulsarClient {
             throw new PulsarClientException.InvalidConfigurationException("Invalid client configuration");
         }
         this.eventLoopGroup = eventLoopGroup;
+        setAuth(conf);
         this.conf = conf;
+        this.clientClock = conf.getClock();
         conf.getAuthentication().start();
         this.cnxPool = cnxPool;
         externalExecutorProvider = new ExecutorProvider(conf.getNumListenerThreads(), getThreadFactory("pulsar-external-listener"));
@@ -151,8 +148,21 @@ public class PulsarClientImpl implements PulsarClient {
         state.set(State.Open);
     }
 
+    private void setAuth(ClientConfigurationData conf) throws PulsarClientException {
+        if (StringUtils.isBlank(conf.getAuthPluginClassName()) || StringUtils.isBlank( conf.getAuthParams())) {
+            return;
+        }
+
+        conf.setAuthentication(AuthenticationFactory.create(conf.getAuthPluginClassName(), conf.getAuthParams()));
+    }
+
     public ClientConfigurationData getConfiguration() {
         return conf;
+    }
+
+    @VisibleForTesting
+    public Clock getClientClock() {
+        return clientClock;
     }
 
     @Override
@@ -183,62 +193,6 @@ public class PulsarClientImpl implements PulsarClient {
     @Override
     public <T> ReaderBuilder<T> newReader(Schema<T> schema) {
         return new ReaderBuilderImpl<>(this, schema);
-    }
-
-    @Override
-    public Producer<byte[]> createProducer(String topic) throws PulsarClientException {
-        try {
-            ProducerConfigurationData conf = new ProducerConfigurationData();
-            conf.setTopicName(topic);
-            return createProducerAsync(conf).get();
-        } catch (ExecutionException e) {
-            Throwable t = e.getCause();
-            if (t instanceof PulsarClientException) {
-                throw (PulsarClientException) t;
-            } else {
-                throw new PulsarClientException(t);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new PulsarClientException(e);
-        }
-    }
-
-    @Override
-    public Producer<byte[]> createProducer(final String topic, final ProducerConfiguration conf) throws PulsarClientException {
-        if (conf == null) {
-            throw new PulsarClientException.InvalidConfigurationException("Invalid null configuration object");
-        }
-
-        try {
-            ProducerConfigurationData confData = conf.getProducerConfigurationData().clone();
-            confData.setTopicName(topic);
-            return createProducerAsync(confData).get();
-        } catch (ExecutionException e) {
-            Throwable t = e.getCause();
-            if (t instanceof PulsarClientException) {
-                throw (PulsarClientException) t;
-            } else {
-                throw new PulsarClientException(t);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new PulsarClientException(e);
-        }
-    }
-
-    @Override
-    public CompletableFuture<Producer<byte[]>> createProducerAsync(String topic) {
-        ProducerConfigurationData conf = new ProducerConfigurationData();
-        conf.setTopicName(topic);
-        return createProducerAsync(conf);
-    }
-
-    @Override
-    public CompletableFuture<Producer<byte[]>> createProducerAsync(final String topic, final ProducerConfiguration conf) {
-        ProducerConfigurationData confData = conf.getProducerConfigurationData().clone();
-        confData.setTopicName(topic);
-        return createProducerAsync(confData);
     }
 
     public CompletableFuture<Producer<byte[]>> createProducerAsync(ProducerConfigurationData conf) {
@@ -320,51 +274,6 @@ public class PulsarClientImpl implements PulsarClient {
         return producerCreatedFuture;
     }
 
-    @Override
-    public Consumer<byte[]> subscribe(final String topic, final String subscription) throws PulsarClientException {
-        return subscribe(topic, subscription, new ConsumerConfiguration());
-    }
-
-    @Override
-    public Consumer<byte[]> subscribe(String topic, String subscription, ConsumerConfiguration conf)
-            throws PulsarClientException {
-        try {
-            return subscribeAsync(topic, subscription, conf).get();
-        } catch (ExecutionException e) {
-            Throwable t = e.getCause();
-            if (t instanceof PulsarClientException) {
-                throw (PulsarClientException) t;
-            } else {
-                throw new PulsarClientException(t);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new PulsarClientException(e);
-        }
-    }
-
-    @Override
-    public CompletableFuture<Consumer<byte[]>> subscribeAsync(String topic, String subscription) {
-        ConsumerConfigurationData<byte[]> conf = new ConsumerConfigurationData<>();
-        conf.getTopicNames().add(topic);
-        conf.setSubscriptionName(subscription);
-        return subscribeAsync(conf);
-    }
-
-    @Override
-    public CompletableFuture<Consumer<byte[]>> subscribeAsync(final String topic, final String subscription,
-            final ConsumerConfiguration conf) {
-        if (conf == null) {
-            return FutureUtil.failedFuture(
-                    new PulsarClientException.InvalidConfigurationException("Invalid null configuration"));
-        }
-
-        ConsumerConfigurationData<byte[]> confData = conf.getConfigurationData().clone();
-        confData.getTopicNames().add(topic);
-        confData.setSubscriptionName(subscription);
-        return subscribeAsync(confData);
-    }
-
     public CompletableFuture<Consumer<byte[]>> subscribeAsync(ConsumerConfigurationData<byte[]> conf) {
         return subscribeAsync(conf, Schema.BYTES, null);
     }
@@ -416,27 +325,9 @@ public class PulsarClientImpl implements PulsarClient {
     }
 
     private <T> CompletableFuture<Consumer<T>> singleTopicSubscribeAsync(ConsumerConfigurationData<T> conf, Schema<T> schema, ConsumerInterceptors<T> interceptors) {
-        if (schema instanceof AutoConsumeSchema) {
-            AutoConsumeSchema autoConsumeSchema = (AutoConsumeSchema) schema;
-            return lookup.getSchema(TopicName.get(conf.getSingleTopic()))
-                    .thenCompose(schemaInfoOptional -> {
-                        if (schemaInfoOptional.isPresent() && schemaInfoOptional.get().getType() == SchemaType.AVRO) {
-                            GenericSchema genericSchema = GenericSchema.of(schemaInfoOptional.get());
-                            log.info("Auto detected schema for topic {} : {}",
-                                conf.getSingleTopic(), new String(schemaInfoOptional.get().getSchema(), UTF_8));
-                            autoConsumeSchema.setSchema(genericSchema);
-                            return doSingleTopicSubscribeAsync(conf, schema, interceptors);
-                        } else {
-                            return FutureUtil.failedFuture(
-                                new PulsarClientException.LookupException("Currently schema detection only works for topics with avro schemas"));
-                        }
-                    });
-        } else {
-            return doSingleTopicSubscribeAsync(conf, schema, interceptors);
-        }
+        return preProcessSchemaBeforeSubscribe(this, schema, conf.getSingleTopic())
+            .thenCompose(ignored -> doSingleTopicSubscribeAsync(conf, schema, interceptors));
     }
-
-
 
     private <T> CompletableFuture<Consumer<T>> doSingleTopicSubscribeAsync(ConsumerConfigurationData<T> conf, Schema<T> schema, ConsumerInterceptors<T> interceptors) {
         CompletableFuture<Consumer<T>> consumerSubscribedFuture = new CompletableFuture<>();
@@ -455,8 +346,10 @@ public class PulsarClientImpl implements PulsarClient {
                 consumer = MultiTopicsConsumerImpl.createPartitionedConsumer(PulsarClientImpl.this, conf,
                     listenerThread, consumerSubscribedFuture, metadata.partitions, schema, interceptors);
             } else {
-                consumer = new ConsumerImpl<>(PulsarClientImpl.this, topic, conf, listenerThread, -1,
-                        consumerSubscribedFuture, schema, interceptors);
+                int partitionIndex = TopicName.getPartitionIndex(topic);
+                consumer = ConsumerImpl.newConsumerImpl(PulsarClientImpl.this, topic, conf, listenerThread, partitionIndex, false,
+                        consumerSubscribedFuture, SubscriptionMode.Durable, null, schema, interceptors,
+                        this.conf.getDefaultBackoffIntervalNanos(), this.conf.getMaxBackoffIntervalNanos());
             }
 
             synchronized (consumers) {
@@ -488,9 +381,10 @@ public class PulsarClientImpl implements PulsarClient {
         return patternTopicSubscribeAsync(conf, Schema.BYTES, null);
     }
 
-    private <T> CompletableFuture<Consumer<T>> patternTopicSubscribeAsync(ConsumerConfigurationData<T> conf, Schema<T> schema, ConsumerInterceptors interceptors) {
+    private <T> CompletableFuture<Consumer<T>> patternTopicSubscribeAsync(ConsumerConfigurationData<T> conf,
+            Schema<T> schema, ConsumerInterceptors<T> interceptors) {
         String regex = conf.getTopicsPattern().pattern();
-        Mode subscriptionMode = conf.getSubscriptionTopicsMode();
+        Mode subscriptionMode = convertRegexSubscriptionMode(conf.getRegexSubscriptionMode());
         TopicName destination = TopicName.get(regex);
         NamespaceName namespaceName = destination.getNamespaceObject();
 
@@ -505,7 +399,7 @@ public class PulsarClientImpl implements PulsarClient {
 
                 List<String> topicsList = topicsPatternFilter(topics, conf.getTopicsPattern());
                 conf.getTopicNames().addAll(topicsList);
-                ConsumerBase<T> consumer = new PatternMultiTopicsConsumerImpl<>(conf.getTopicsPattern(),
+                ConsumerBase<T> consumer = new PatternMultiTopicsConsumerImpl<T>(conf.getTopicsPattern(),
                     PulsarClientImpl.this,
                     conf,
                     externalExecutorProvider.getExecutor(),
@@ -538,57 +432,15 @@ public class PulsarClientImpl implements PulsarClient {
             .collect(Collectors.toList());
     }
 
-    @Override
-    public Reader<byte[]> createReader(String topic, MessageId startMessageId, ReaderConfiguration conf)
-            throws PulsarClientException {
-        try {
-            return createReaderAsync(topic, startMessageId, conf).get();
-        } catch (ExecutionException e) {
-            Throwable t = e.getCause();
-            if (t instanceof PulsarClientException) {
-                throw (PulsarClientException) t;
-            } else {
-                throw new PulsarClientException(t);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new PulsarClientException(e);
-        }
-    }
-
-    @Override
-    public CompletableFuture<Reader<byte[]>> createReaderAsync(String topic, MessageId startMessageId,
-            ReaderConfiguration conf) {
-        ReaderConfigurationData<byte[]> confData = conf.getReaderConfigurationData().clone();
-        confData.setTopicName(topic);
-        confData.setStartMessageId(startMessageId);
-        return createReaderAsync(confData);
-    }
-
     public CompletableFuture<Reader<byte[]>> createReaderAsync(ReaderConfigurationData<byte[]> conf) {
         return createReaderAsync(conf, Schema.BYTES);
     }
 
     public <T> CompletableFuture<Reader<T>> createReaderAsync(ReaderConfigurationData<T> conf, Schema<T> schema) {
-        if (schema instanceof AutoConsumeSchema) {
-            AutoConsumeSchema autoConsumeSchema = (AutoConsumeSchema) schema;
-            return lookup.getSchema(TopicName.get(conf.getTopicName()))
-                    .thenCompose(schemaInfoOptional -> {
-                        if (schemaInfoOptional.isPresent() && schemaInfoOptional.get().getType() == SchemaType.AVRO) {
-                            GenericSchema genericSchema = GenericSchema.of(schemaInfoOptional.get());
-                            log.info("Auto detected schema for topic {} : {}",
-                                conf.getTopicName(), new String(schemaInfoOptional.get().getSchema(), UTF_8));
-                            autoConsumeSchema.setSchema(genericSchema);
-                            return doCreateReaderAsync(conf, schema);
-                        } else {
-                            return FutureUtil.failedFuture(
-                                new PulsarClientException.LookupException("Currently schema detection only works for topics with avro schemas"));
-                        }
-                    });
-        } else {
-            return doCreateReaderAsync(conf, schema);
-        }
+        return preProcessSchemaBeforeSubscribe(this, schema, conf.getTopicName())
+            .thenCompose(ignored -> doCreateReaderAsync(conf, schema));
     }
+
     <T> CompletableFuture<Reader<T>> doCreateReaderAsync(ReaderConfigurationData<T> conf, Schema<T> schema) {
         if (state.get() != State.Open) {
             return FutureUtil.failedFuture(new PulsarClientException.AlreadyClosedException("Client already closed"));
@@ -669,15 +521,8 @@ public class PulsarClientImpl implements PulsarClient {
     public void close() throws PulsarClientException {
         try {
             closeAsync().get();
-        } catch (ExecutionException e) {
-            Throwable t = e.getCause();
-            if (t instanceof PulsarClientException) {
-                throw (PulsarClientException) t;
-            } else {
-                throw new PulsarClientException(t);
-            }
-        } catch (InterruptedException e) {
-            throw new PulsarClientException(e);
+        } catch (Exception e) {
+            throw PulsarClientException.unwrap(e);
         }
     }
 
@@ -730,7 +575,7 @@ public class PulsarClientImpl implements PulsarClient {
             conf.getAuthentication().close();
         } catch (Throwable t) {
             log.warn("Failed to shutdown Pulsar client", t);
-            throw new PulsarClientException(t);
+            throw PulsarClientException.unwrap(t);
         }
     }
 
@@ -749,7 +594,7 @@ public class PulsarClientImpl implements PulsarClient {
                 .thenCompose(pair -> cnxPool.getConnection(pair.getLeft(), pair.getRight()));
     }
 
-    /** visiable for pulsar-functions **/
+    /** visible for pulsar-functions **/
     public Timer timer() {
         return timer;
     }
@@ -857,4 +702,63 @@ public class PulsarClientImpl implements PulsarClient {
             return consumers.size();
         }
     }
+
+    private static Mode convertRegexSubscriptionMode(RegexSubscriptionMode regexSubscriptionMode) {
+        switch (regexSubscriptionMode) {
+        case PersistentOnly:
+            return Mode.PERSISTENT;
+        case NonPersistentOnly:
+            return Mode.NON_PERSISTENT;
+        case AllTopics:
+            return Mode.ALL;
+        default:
+            return null;
+        }
+    }
+
+    private SchemaInfoProvider newSchemaProvider(String topicName) {
+        return new MultiVersionSchemaInfoProvider(TopicName.get(topicName), this);
+    }
+
+    private LoadingCache<String, SchemaInfoProvider> getSchemaProviderLoadingCache() {
+        return schemaProviderLoadingCache;
+    }
+
+    @SuppressWarnings("unchecked")
+    protected CompletableFuture<Void> preProcessSchemaBeforeSubscribe(PulsarClientImpl pulsarClientImpl,
+                                                                      Schema schema,
+                                                                      String topicName) {
+        if (schema != null && schema.supportSchemaVersioning()) {
+            final SchemaInfoProvider schemaInfoProvider;
+            try {
+                schemaInfoProvider = pulsarClientImpl.getSchemaProviderLoadingCache().get(topicName);
+            } catch (ExecutionException e) {
+                log.error("Failed to load schema info provider for topic {}", topicName, e);
+                return FutureUtil.failedFuture(e.getCause());
+            }
+
+            if (schema.requireFetchingSchemaInfo()) {
+                return schemaInfoProvider.getLatestSchema().thenCompose(schemaInfo -> {
+                    if (null == schemaInfo) {
+                        // no schema info is found
+                        return FutureUtil.failedFuture(
+                            new PulsarClientException.NotFoundException(
+                                "No latest schema found for topic " + topicName));
+                    }
+                    try {
+                        log.info("Configuring schema for topic {} : {}", topicName, schemaInfo);
+                        schema.configureSchemaInfo(topicName, "topic", schemaInfo);
+                    } catch (RuntimeException re) {
+                        return FutureUtil.failedFuture(re);
+                    }
+                    schema.setSchemaInfoProvider(schemaInfoProvider);
+                    return CompletableFuture.completedFuture(null);
+                });
+            } else {
+                schema.setSchemaInfoProvider(schemaInfoProvider);
+            }
+        }
+        return CompletableFuture.completedFuture(null);
+    }
+
 }

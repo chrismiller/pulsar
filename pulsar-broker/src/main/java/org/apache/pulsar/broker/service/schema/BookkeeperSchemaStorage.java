@@ -25,15 +25,17 @@ import static java.util.Objects.isNull;
 import static java.util.Objects.nonNull;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static org.apache.pulsar.broker.service.schema.BookkeeperSchemaStorage.Functions.newSchemaEntry;
+import static org.apache.pulsar.broker.service.schema.SchemaRegistryServiceImpl.NO_DELETED_VERSION;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.protobuf.ByteString;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -45,10 +47,11 @@ import org.apache.bookkeeper.client.BKException;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.apache.bookkeeper.client.LedgerEntry;
 import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.mledger.impl.LedgerMetadataUtils;
 import org.apache.bookkeeper.util.ZkUtils;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
-import org.apache.pulsar.common.schema.SchemaVersion;
+import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.zookeeper.ZooKeeperCache;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
@@ -98,13 +101,15 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
     public void start() throws IOException {
         this.bookKeeper = pulsar.getBookKeeperClientFactory().create(
             pulsar.getConfiguration(),
-            pulsar.getZkClient()
+            pulsar.getZkClient(),
+            Optional.empty(),
+            null
         );
     }
 
     @Override
-    public CompletableFuture<SchemaVersion> put(String key, byte[] value, byte[] hash) {
-        return putSchemaIfAbsent(key, value, hash).thenApply(LongSchemaVersion::new);
+    public CompletableFuture<SchemaVersion> put(String key, byte[] value, byte[] hash, long maxDeletedVersion) {
+        return putSchemaIfAbsent(key, value, hash, maxDeletedVersion).thenApply(LongSchemaVersion::new);
     }
 
     @Override
@@ -115,6 +120,33 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
             LongSchemaVersion longVersion = (LongSchemaVersion) version;
             return getSchema(key, longVersion.getVersion());
         }
+    }
+
+    @Override
+    public CompletableFuture<List<CompletableFuture<StoredSchema>>> getAll(String key) {
+        CompletableFuture<List<CompletableFuture<StoredSchema>>> result = new CompletableFuture<>();
+        getSchemaLocator(getSchemaPath(key)).thenAccept(locator -> {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Get all schemas - locator: {}", key, locator);
+            }
+
+            if (!locator.isPresent()) {
+                result.complete(Collections.emptyList());
+            }
+
+            SchemaStorageFormat.SchemaLocator schemaLocator = locator.get().locator;
+            List<CompletableFuture<StoredSchema>> list = new ArrayList<>();
+            schemaLocator.getIndexList().forEach(indexEntry -> list.add(readSchemaEntry(indexEntry.getPosition())
+                .thenApply(entry -> new StoredSchema
+                    (
+                        entry.getSchemaData().toByteArray(),
+                        new LongSchemaVersion(indexEntry.getVersion())
+                    )
+                )
+            ));
+            result.complete(list);
+        });
+        return result;
     }
 
     @Override
@@ -164,6 +196,12 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
 
     @Override
     public SchemaVersion versionFromBytes(byte[] version) {
+        // The schema storage converts the schema from bytes to long
+        // so it handles both cases 1) version is 64 bytes long pre 2.4.0;
+        // 2) version is 8 bytes long post 2.4.0
+        //
+        // NOTE: if you are planning to change the logic here. you should consider
+        //       both 64 bytes and 8 bytes cases.
         ByteBuffer bb = ByteBuffer.wrap(version);
         return new LongSchemaVersion(bb.getLong());
     }
@@ -210,7 +248,7 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
         return getSchemaLocator(getSchemaPath(schemaId)).thenCompose(optLocatorEntry -> {
             if (optLocatorEntry.isPresent()) {
                 // Schema locator was already present
-                return addNewSchemaEntryToStore(optLocatorEntry.get().locator.getIndexList(), data)
+                return addNewSchemaEntryToStore(schemaId, optLocatorEntry.get().locator.getIndexList(), data)
                         .thenCompose(position -> updateSchemaLocator(schemaId, optLocatorEntry.get(), position, hash));
             } else {
                 // No schema was defined yet
@@ -242,7 +280,7 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
     }
 
     @NotNull
-    private CompletableFuture<Long> putSchemaIfAbsent(String schemaId, byte[] data, byte[] hash) {
+    private CompletableFuture<Long> putSchemaIfAbsent(String schemaId, byte[] data, byte[] hash, long maxDeletedVersion) {
         return getSchemaLocator(getSchemaPath(schemaId)).thenCompose(optLocatorEntry -> {
 
             if (optLocatorEntry.isPresent()) {
@@ -257,9 +295,9 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
                     log.debug("[{}] findSchemaEntryByHash - hash={}", schemaId, hash);
                 }
 
-                return findSchemaEntryByHash(locator.getIndexList(), hash).thenCompose(version -> {
+                return findSchemaEntryByHash(locator.getIndexList(), hash, maxDeletedVersion).thenCompose(version -> {
                     if (isNull(version)) {
-                        return addNewSchemaEntryToStore(locator.getIndexList(), data).thenCompose(
+                        return addNewSchemaEntryToStore(schemaId, locator.getIndexList(), data).thenCompose(
                                 position -> updateSchemaLocator(schemaId, optLocatorEntry.get(), position, hash));
                     } else {
                         return completedFuture(version);
@@ -275,7 +313,7 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
                                 // There was a race condition on the schema creation. Since it has now been created,
                                 // retry the whole operation so that we have a chance to recover without bubbling error
                                 // back to producer/consumer
-                                putSchemaIfAbsent(schemaId, data, hash)
+                                putSchemaIfAbsent(schemaId, data, hash, NO_DELETED_VERSION)
                                         .thenAccept(version -> future.complete(version))
                                         .exceptionally(ex2 -> {
                                             future.completeExceptionally(ex2);
@@ -303,7 +341,7 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
                                 .setLedgerId(-1L)
                         ).build();
 
-        return addNewSchemaEntryToStore(Collections.singletonList(emptyIndex), data).thenCompose(position -> {
+        return addNewSchemaEntryToStore(schemaId, Collections.singletonList(emptyIndex), data).thenCompose(position -> {
             // The schema was stored in the ledger, now update the z-node with the pointer to it
             SchemaStorageFormat.IndexEntry info = SchemaStorageFormat.IndexEntry.newBuilder()
                     .setVersion(0)
@@ -338,11 +376,12 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
 
     @NotNull
     private CompletableFuture<SchemaStorageFormat.PositionInfo> addNewSchemaEntryToStore(
+        String schemaId,
         List<SchemaStorageFormat.IndexEntry> index,
         byte[] data
     ) {
         SchemaStorageFormat.SchemaEntry schemaEntry = newSchemaEntry(index, data);
-        return createLedger().thenCompose(ledgerHandle ->
+        return createLedger(schemaId).thenCompose(ledgerHandle ->
             addEntry(ledgerHandle, schemaEntry).thenApply(entryId ->
                 Functions.newPositionInfo(ledgerHandle.getId(), entryId)
             )
@@ -403,7 +442,8 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
     @NotNull
     private CompletableFuture<Long> findSchemaEntryByHash(
         List<SchemaStorageFormat.IndexEntry> index,
-        byte[] hash
+        byte[] hash,
+        long maxDeletedVersion
     ) {
 
         if (index.isEmpty()) {
@@ -412,7 +452,11 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
 
         for (SchemaStorageFormat.IndexEntry entry : index) {
             if (Arrays.equals(entry.getHash().toByteArray(), hash)) {
-                return completedFuture(entry.getVersion());
+                if (entry.getVersion() > maxDeletedVersion) {
+                    return completedFuture(entry.getVersion());
+                } else {
+                    return completedFuture(null);
+                }
             }
         }
 
@@ -420,7 +464,7 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
             return completedFuture(null);
         } else {
             return readSchemaEntry(index.get(0).getPosition())
-                    .thenCompose(entry -> findSchemaEntryByHash(entry.getIndexList(), hash));
+                    .thenCompose(entry -> findSchemaEntryByHash(entry.getIndexList(), hash, maxDeletedVersion));
         }
 
     }
@@ -497,7 +541,8 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
     }
 
     @NotNull
-    private CompletableFuture<LedgerHandle> createLedger() {
+    private CompletableFuture<LedgerHandle> createLedger(String schemaId) {
+        Map<String, byte[]> metadata = LedgerMetadataUtils.buildMetadataForSchema(schemaId);
         final CompletableFuture<LedgerHandle> future = new CompletableFuture<>();
         bookKeeper.asyncCreateLedger(
             config.getManagedLedgerDefaultEnsembleSize(),
@@ -511,7 +556,7 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
                 } else {
                     future.complete(handle);
                 }
-            }, null, Collections.emptyMap()
+            }, null, metadata
         );
         return future;
     }
@@ -608,7 +653,8 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
     }
 
     public static Exception bkException(String operation, int rc, long ledgerId, long entryId) {
-        String message = org.apache.bookkeeper.client.api.BKException.getMessage(rc) + " -  ledger=" + ledgerId;
+        String message = org.apache.bookkeeper.client.api.BKException.getMessage(rc)
+                + " -  ledger=" + ledgerId + " - operation=" + operation;
 
         if (entryId != -1) {
             message += " - entry=" + entryId;

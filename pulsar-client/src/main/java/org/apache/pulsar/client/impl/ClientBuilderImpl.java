@@ -18,6 +18,7 @@
  */
 package org.apache.pulsar.client.impl;
 
+import java.time.Clock;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -45,11 +46,18 @@ public class ClientBuilderImpl implements ClientBuilder {
 
     @Override
     public PulsarClient build() throws PulsarClientException {
-        if (conf.getServiceUrlProvider() != null && StringUtils.isNotBlank(conf.getServiceUrlProvider().getServiceUrl())) {
-            conf.setServiceUrl(conf.getServiceUrlProvider().getServiceUrl());
+        if (StringUtils.isBlank(conf.getServiceUrl()) && conf.getServiceUrlProvider() == null) {
+            throw new IllegalArgumentException("service URL or service URL provider needs to be specified on the ClientBuilder object.");
         }
-        if (conf.getServiceUrl() == null) {
-            throw new IllegalArgumentException("service URL or service URL provider needs to be specified on the ClientBuilder object");
+        if (StringUtils.isNotBlank(conf.getServiceUrl()) && conf.getServiceUrlProvider() != null) {
+            throw new IllegalArgumentException("Can only chose one way service URL or service URL provider.");
+        }
+        if (conf.getServiceUrlProvider() != null) {
+            if (StringUtils.isBlank(conf.getServiceUrlProvider().getServiceUrl())) {
+                throw new IllegalArgumentException("Cannot get service url from service url provider.");
+            } else {
+                conf.setServiceUrl(conf.getServiceUrlProvider().getServiceUrl());
+            }
         }
         PulsarClient client = new PulsarClientImpl(conf);
         if (conf.getServiceUrlProvider() != null) {
@@ -72,6 +80,9 @@ public class ClientBuilderImpl implements ClientBuilder {
 
     @Override
     public ClientBuilder serviceUrl(String serviceUrl) {
+        if (StringUtils.isBlank(serviceUrl)) {
+            throw new IllegalArgumentException("Param serviceUrl must not be blank.");
+        }
         conf.setServiceUrl(serviceUrl);
         if (!conf.isUseTls()) {
             enableTls(serviceUrl.startsWith("pulsar+ssl") || serviceUrl.startsWith("https"));
@@ -81,6 +92,9 @@ public class ClientBuilderImpl implements ClientBuilder {
 
     @Override
     public ClientBuilder serviceUrlProvider(ServiceUrlProvider serviceUrlProvider) {
+        if (serviceUrlProvider == null) {
+            throw new IllegalArgumentException("Param serviceUrlProvider must not be null.");
+        }
         conf.setServiceUrlProvider(serviceUrlProvider);
         return this;
     }
@@ -184,8 +198,8 @@ public class ClientBuilderImpl implements ClientBuilder {
     }
 
     @Override
-    public ClientBuilder keepAliveInterval(int keepAliveIntervalSeconds, TimeUnit unit) {
-        conf.setKeepAliveIntervalSeconds((int)unit.toSeconds(keepAliveIntervalSeconds));
+    public ClientBuilder keepAliveInterval(int keepAliveInterval, TimeUnit unit) {
+        conf.setKeepAliveIntervalSeconds((int)unit.toSeconds(keepAliveInterval));
         return this;
     }
 
@@ -195,7 +209,25 @@ public class ClientBuilderImpl implements ClientBuilder {
         return this;
     }
 
+    @Override
+    public ClientBuilder startingBackoffInterval(long duration, TimeUnit unit) {
+    	conf.setDefaultBackoffIntervalNanos(unit.toNanos(duration));
+    	return this;
+    }
+    
+    @Override
+    public ClientBuilder maxBackoffInterval(long duration, TimeUnit unit) {
+    	conf.setMaxBackoffIntervalNanos(unit.toNanos(duration));
+    	return this;
+    }
+    
     public ClientConfigurationData getClientConfigurationData() {
         return conf;
+    }
+
+    @Override
+    public ClientBuilder clock(Clock clock) {
+        conf.setClock(clock);
+        return this;
     }
 }

@@ -18,10 +18,10 @@
  */
 package org.apache.bookkeeper.mledger.impl;
 
-import static org.mockito.Matchers.anyLong;
-import static org.mockito.Matchers.anyMap;
-import static org.mockito.Matchers.anyObject;
-import static org.mockito.Matchers.eq;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -31,7 +31,7 @@ import com.google.common.collect.Lists;
 
 import io.netty.buffer.ByteBuf;
 
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -48,23 +48,16 @@ import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.client.api.ReadHandle;
 import org.apache.bookkeeper.client.impl.LedgerEntriesImpl;
 import org.apache.bookkeeper.client.impl.LedgerEntryImpl;
-
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.LedgerOffloader;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.net.BookieSocketAddress;
 import org.apache.bookkeeper.test.MockedBookKeeperTestCase;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
 public class OffloadPrefixReadTest extends MockedBookKeeperTestCase {
-    private static final Logger log = LoggerFactory.getLogger(OffloadPrefixReadTest.class);
-
     @Test
     public void testOffloadRead() throws Exception {
         MockLedgerOffloader offloader = spy(new MockLedgerOffloader());
@@ -72,6 +65,7 @@ public class OffloadPrefixReadTest extends MockedBookKeeperTestCase {
         config.setMaxEntriesPerLedger(10);
         config.setMinimumRolloverTime(0, TimeUnit.SECONDS);
         config.setRetentionTime(10, TimeUnit.MINUTES);
+        config.setRetentionSizeInMB(10);
         config.setLedgerOffloader(offloader);
         ManagedLedgerImpl ledger = (ManagedLedgerImpl)factory.open("my_test_ledger", config);
 
@@ -100,21 +94,21 @@ public class OffloadPrefixReadTest extends MockedBookKeeperTestCase {
             Assert.assertEquals(new String(e.getData()), "entry-" + i++);
         }
         verify(offloader, times(1))
-            .readOffloaded(anyLong(), anyObject(), anyMap());
+            .readOffloaded(anyLong(), any(), anyMap());
         verify(offloader).readOffloaded(anyLong(), eq(firstLedgerUUID), anyMap());
 
         for (Entry e : cursor.readEntries(10)) {
             Assert.assertEquals(new String(e.getData()), "entry-" + i++);
         }
         verify(offloader, times(2))
-            .readOffloaded(anyLong(), anyObject(), anyMap());
+            .readOffloaded(anyLong(), any(), anyMap());
         verify(offloader).readOffloaded(anyLong(), eq(secondLedgerUUID), anyMap());
 
         for (Entry e : cursor.readEntries(5)) {
             Assert.assertEquals(new String(e.getData()), "entry-" + i++);
         }
         verify(offloader, times(2))
-            .readOffloaded(anyLong(), anyObject(), anyMap());
+            .readOffloaded(anyLong(), any(), anyMap());
     }
 
     static class MockLedgerOffloader implements LedgerOffloader {
@@ -245,6 +239,9 @@ public class OffloadPrefixReadTest extends MockedBookKeeperTestCase {
         private final DigestType digestType;
         private final long ctime;
         private final boolean isClosed;
+        private final int metadataFormatVersion;
+        private final State state;
+        private final byte[] password;
         private final Map<String, byte[]> customMetadata;
 
         MockMetadata(LedgerMetadata toCopy) {
@@ -256,9 +253,20 @@ public class OffloadPrefixReadTest extends MockedBookKeeperTestCase {
             digestType = toCopy.getDigestType();
             ctime = toCopy.getCtime();
             isClosed = toCopy.isClosed();
-
+            metadataFormatVersion = toCopy.getMetadataFormatVersion();
+            state = toCopy.getState();
+            password = Arrays.copyOf(toCopy.getPassword(), toCopy.getPassword().length);
             customMetadata = ImmutableMap.copyOf(toCopy.getCustomMetadata());
         }
+
+        @Override
+        public boolean hasPassword() { return true; }
+
+        @Override
+        public State getState() { return state; }
+
+        @Override
+        public int getMetadataFormatVersion() { return metadataFormatVersion; }
 
         @Override
         public int getEnsembleSize() { return ensembleSize; }
@@ -279,6 +287,9 @@ public class OffloadPrefixReadTest extends MockedBookKeeperTestCase {
         public DigestType getDigestType() { return digestType; }
 
         @Override
+        public byte[] getPassword() { return password; }
+
+        @Override
         public long getCtime() { return ctime; }
 
         @Override
@@ -295,6 +306,11 @@ public class OffloadPrefixReadTest extends MockedBookKeeperTestCase {
         @Override
         public NavigableMap<Long, ? extends List<BookieSocketAddress>> getAllEnsembles() {
             throw new UnsupportedOperationException("Pulsar shouldn't look at this");
+        }
+
+        @Override
+        public String toSafeString() {
+            return toString();
         }
     }
 }

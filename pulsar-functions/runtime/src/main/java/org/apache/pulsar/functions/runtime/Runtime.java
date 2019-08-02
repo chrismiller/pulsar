@@ -21,6 +21,7 @@ package org.apache.pulsar.functions.runtime;
 
 import org.apache.pulsar.functions.proto.InstanceCommunication;
 
+import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -34,6 +35,10 @@ public interface Runtime {
 
     void stop() throws Exception;
 
+    default void terminate() throws Exception {
+        stop();
+    }
+
     boolean isAlive();
 
     Throwable getDeathException();
@@ -44,6 +49,7 @@ public interface Runtime {
     
     CompletableFuture<Void> resetMetrics();
     
-    CompletableFuture<InstanceCommunication.MetricsData> getMetrics();
+    CompletableFuture<InstanceCommunication.MetricsData> getMetrics(int instanceId);
 
+    String getPrometheusMetrics() throws IOException;
 }

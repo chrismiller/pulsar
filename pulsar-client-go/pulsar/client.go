@@ -19,14 +19,28 @@
 
 package pulsar
 
-import "time"
+import (
+	"time"
+
+	log "github.com/apache/pulsar/pulsar-client-go/logutil"
+)
 
 func NewClient(options ClientOptions) (Client, error) {
 	return newClient(options)
 }
 
 // Opaque interface that represents the authentication credentials
-type Authentication interface {}
+type Authentication interface{}
+
+// Create new Authentication provider with specified auth token
+func NewAuthenticationToken(token string) Authentication {
+	return newAuthenticationToken(token)
+}
+
+// Create new Authentication provider with specified auth token supplier
+func NewAuthenticationTokenSupplier(tokenSupplier func() string) Authentication {
+	return newAuthenticationTokenSupplier(tokenSupplier)
+}
 
 // Create new Authentication provider with specified TLS certificate and private key
 func NewAuthenticationTLS(certificatePath string, privateKeyPath string) Authentication {
@@ -64,13 +78,16 @@ type ClientOptions struct {
 	// By default, log messages will be printed on standard output. By passing a logger function, application
 	// can determine how to print logs. This function will be called each time the Pulsar client library wants
 	// to write any logs.
-	Logger func(level LoggerLevel, file string, line int, message string)
+	Logger func(level log.LoggerLevel, file string, line int, message string)
 
 	// Set the path to the trusted TLS certificate file
 	TLSTrustCertsFilePath string
 
 	// Configure whether the Pulsar client accept untrusted TLS certificate from broker (default: false)
 	TLSAllowInsecureConnection bool
+
+	// Configure whether the Pulsar client verify the validity of the host name from broker (default: false)
+	TLSValidateHostname bool
 
 	// Configure the authentication provider. (default: no authentication)
 	// Example: `Authentication: NewAuthenticationTLS("my-cert.pem", "my-key.pem")`
@@ -86,15 +103,21 @@ type Client interface {
 	// This method will block until the producer is created successfully
 	CreateProducer(ProducerOptions) (Producer, error)
 
+	CreateProducerWithSchema(ProducerOptions, Schema) (Producer, error)
+
 	// Create a `Consumer` by subscribing to a topic.
 	//
 	// If the subscription does not exist, a new subscription will be created and all messages published after the
 	// creation will be retained until acknowledged, even if the consumer is not connected
 	Subscribe(ConsumerOptions) (Consumer, error)
 
+	SubscribeWithSchema(ConsumerOptions, Schema) (Consumer, error)
+
 	// Create a Reader instance.
 	// This method will block until the reader is created successfully.
 	CreateReader(ReaderOptions) (Reader, error)
+
+	CreateReaderWithSchema(ReaderOptions, Schema) (Reader, error)
 
 	// Fetch the list of partitions for a given topic
 	//

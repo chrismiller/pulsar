@@ -240,7 +240,7 @@ public class PulsarStandalone implements AutoCloseable {
     @Parameter(names = { "-h", "--help" }, description = "Show this help message")
     private boolean help = false;
 
-    void start() throws Exception {
+    public void start() throws Exception {
 
         if (config == null) {
             System.exit(1);
@@ -272,20 +272,53 @@ public class PulsarStandalone implements AutoCloseable {
                 workerConfig = WorkerConfig.load(this.getFnWorkerConfigFile());
             }
             // worker talks to local broker
-            workerConfig.setPulsarServiceUrl("pulsar://127.0.0.1:" + config.getBrokerServicePort());
-            workerConfig.setPulsarWebServiceUrl("http://127.0.0.1:" + config.getWebServicePort());
-            if (!this.isNoStreamStorage()) {
+            boolean useTls = workerConfig.isUseTls();
+            String pulsarServiceUrl = useTls
+                    ? PulsarService.brokerUrlTls(config)
+                    : PulsarService.brokerUrl(config);
+            String webServiceUrl = useTls
+                    ? PulsarService.webAddressTls(config)
+                    : PulsarService.webAddress(config);
+            workerConfig.setPulsarServiceUrl(pulsarServiceUrl);
+            workerConfig.setPulsarWebServiceUrl(webServiceUrl);
+            if (this.isNoStreamStorage()) {
                 // only set the state storage service url when state is enabled.
+                workerConfig.setStateStorageServiceUrl(null);
+            } else if (workerConfig.getStateStorageServiceUrl() == null) {
                 workerConfig.setStateStorageServiceUrl("bk://127.0.0.1:" + this.getStreamStoragePort());
             }
+
             String hostname = ServiceConfigurationUtils.getDefaultOrConfiguredAddress(
                 config.getAdvertisedAddress());
             workerConfig.setWorkerHostname(hostname);
-            workerConfig.setWorkerPort(config.getWebServicePort());
+            workerConfig.setWorkerPort(config.getWebServicePort().get());
             workerConfig.setWorkerId(
                 "c-" + config.getClusterName()
                     + "-fw-" + hostname
                     + "-" + workerConfig.getWorkerPort());
+            // inherit broker authorization setting
+            workerConfig.setAuthenticationEnabled(config.isAuthenticationEnabled());
+            workerConfig.setAuthenticationProviders(config.getAuthenticationProviders());
+
+            workerConfig.setAuthorizationEnabled(config.isAuthorizationEnabled());
+            workerConfig.setAuthorizationProvider(config.getAuthorizationProvider());
+            workerConfig.setConfigurationStoreServers(config.getConfigurationStoreServers());
+            workerConfig.setZooKeeperSessionTimeoutMillis(config.getZooKeeperSessionTimeoutMillis());
+            workerConfig.setZooKeeperOperationTimeoutSeconds(config.getZooKeeperOperationTimeoutSeconds());
+
+            workerConfig.setUseTls(config.isTlsEnabled());
+            workerConfig.setTlsHostnameVerificationEnable(false);
+
+            workerConfig.setTlsAllowInsecureConnection(config.isTlsAllowInsecureConnection());
+            workerConfig.setTlsTrustCertsFilePath(config.getTlsTrustCertsFilePath());
+
+            // client in worker will use this config to authenticate with broker
+            workerConfig.setClientAuthenticationPlugin(config.getBrokerClientAuthenticationPlugin());
+            workerConfig.setClientAuthenticationParameters(config.getBrokerClientAuthenticationParameters());
+
+            // inherit super users
+            workerConfig.setSuperUserRoles(config.getSuperUserRoles());
+
             fnWorkerService = new WorkerService(workerConfig);
         }
 
@@ -294,9 +327,9 @@ public class PulsarStandalone implements AutoCloseable {
         broker.start();
 
         URL webServiceUrl = new URL(
-                String.format("http://%s:%d", config.getAdvertisedAddress(), config.getWebServicePort()));
+                String.format("http://%s:%d", config.getAdvertisedAddress(), config.getWebServicePort().get()));
         final String brokerServiceUrl = String.format("pulsar://%s:%d", config.getAdvertisedAddress(),
-                config.getBrokerServicePort());
+                config.getBrokerServicePort().get());
         admin = PulsarAdmin.builder().serviceHttpUrl(webServiceUrl.toString()).authentication(
                 config.getBrokerClientAuthenticationPlugin(), config.getBrokerClientAuthenticationParameters()).build();
 
@@ -358,7 +391,7 @@ public class PulsarStandalone implements AutoCloseable {
         }
     }
 
-    /** this methods gets a buidler to use to build and an embedded pulsar instance `
+    /** This method gets a builder to build an embedded pulsar instance
      * i.e.
      * <pre>
      * <code>

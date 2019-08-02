@@ -24,7 +24,6 @@ import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Schema;
-import org.apache.pulsar.client.impl.schema.JSONSchema;
 import org.apache.pulsar.functions.api.examples.pojo.Tick;
 import org.apache.pulsar.tests.integration.containers.BrokerContainer;
 import org.apache.pulsar.tests.integration.docker.ContainerExecException;
@@ -36,7 +35,6 @@ import org.testng.annotations.Test;
 
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.Assert.assertThat;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
@@ -161,7 +159,7 @@ public class CLITest extends PulsarTestSuite {
             "schemas",
             "get",
             topicName);
-        assertTrue(result.getStdout().contains("\"type\" : \"STRING\""));
+        assertTrue(result.getStdout().contains("\"type\": \"STRING\""));
 
         // delete the schema
         result = container.execCmd(

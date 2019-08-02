@@ -60,6 +60,8 @@ const std::string& Producer::getProducerName() const { return impl_->getProducer
 
 int64_t Producer::getLastSequenceId() const { return impl_->getLastSequenceId(); }
 
+const std::string& Producer::getSchemaVersion() const { return impl_->getSchemaVersion(); }
+
 Result Producer::close() {
     Promise<bool, Result> promise;
     closeAsync(WaitForCallback(promise));
@@ -76,5 +78,23 @@ void Producer::closeAsync(CloseCallback callback) {
     }
 
     impl_->closeAsync(callback);
+}
+
+Result Producer::flush() {
+    Promise<bool, Result> promise;
+    flushAsync(WaitForCallback(promise));
+
+    Result result;
+    promise.getFuture().get(result);
+    return result;
+}
+
+void Producer::flushAsync(FlushCallback callback) {
+    if (!impl_) {
+        callback(ResultProducerNotInitialized);
+        return;
+    }
+
+    impl_->flushAsync(callback);
 }
 }  // namespace pulsar

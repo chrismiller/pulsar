@@ -49,7 +49,10 @@ public class OffloaderUtils {
      * @throws IOException when fail to retrieve the pulsar offloader class
      */
     static Pair<NarClassLoader, LedgerOffloaderFactory> getOffloaderFactory(String narPath) throws IOException {
-        NarClassLoader ncl = NarClassLoader.getFromArchive(new File(narPath), Collections.emptySet());
+        // need to load offloader NAR to the classloader that also loaded LedgerOffloaderFactory in case
+        // LedgerOffloaderFactory is loaded by a classloader that is not the default classloader
+        // as is the case for the pulsar presto plugin
+        NarClassLoader ncl = NarClassLoader.getFromArchive(new File(narPath), Collections.emptySet(), LedgerOffloaderFactory.class.getClassLoader());
         String configStr = ncl.getServiceDefinition(PULSAR_OFFLOADER_SERVICE_NAME);
 
         OffloaderDefinition conf = ObjectMapperFactory.getThreadLocalYaml()
@@ -66,8 +69,6 @@ public class OffloaderUtils {
             CompletableFuture<LedgerOffloaderFactory> loadFuture = new CompletableFuture<>();
             Thread loadingThread = new Thread(() -> {
                 Thread.currentThread().setContextClassLoader(ncl);
-
-                log.info("Loading offloader factory {} using class loader {}", factoryClass, ncl);
                 try {
                     Object offloader = factoryClass.newInstance();
                     if (!(offloader instanceof LedgerOffloaderFactory)) {
@@ -114,7 +115,7 @@ public class OffloaderUtils {
 
     public static Offloaders searchForOffloaders(String connectorsDirectory) throws IOException {
         Path path = Paths.get(connectorsDirectory).toAbsolutePath();
-        log.info("Searching for connectors in {}", path);
+        log.info("Searching for offloaders in {}", path);
 
         Offloaders offloaders = new Offloaders();
 
@@ -142,6 +143,7 @@ public class OffloaderUtils {
                 }
             });
         }
+        log.info("Found and loaded {} offloaders", offloaders.getOffloaders().size());
         return offloaders;
     }
 

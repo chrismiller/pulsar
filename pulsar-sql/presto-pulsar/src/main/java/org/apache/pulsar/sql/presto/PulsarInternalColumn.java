@@ -27,7 +27,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.common.api.raw.RawMessage;
 
 import java.util.Map;
 import java.util.Set;
@@ -46,7 +46,7 @@ public abstract class PulsarInternalColumn {
         }
 
         @Override
-        public Object getData(Message message) {
+        public Object getData(RawMessage message) {
             return message.getEventTime() == 0 ? null : message.getEventTime();
         }
     }
@@ -58,7 +58,7 @@ public abstract class PulsarInternalColumn {
         }
 
         @Override
-        public Object getData(Message message) {
+        public Object getData(RawMessage message) {
             return message.getPublishTime();
         }
     }
@@ -70,7 +70,7 @@ public abstract class PulsarInternalColumn {
         }
 
         @Override
-        public Object getData(Message message) {
+        public Object getData(RawMessage message) {
             return message.getMessageId().toString();
         }
     }
@@ -82,7 +82,7 @@ public abstract class PulsarInternalColumn {
         }
 
         @Override
-        public Object getData(Message message) {
+        public Object getData(RawMessage message) {
             return message.getSequenceId();
         }
     }
@@ -94,7 +94,7 @@ public abstract class PulsarInternalColumn {
         }
 
         @Override
-        public Object getData(Message message) {
+        public Object getData(RawMessage message) {
             return message.getProducerName();
         }
     }
@@ -106,8 +106,8 @@ public abstract class PulsarInternalColumn {
         }
 
         @Override
-        public Object getData(Message message) {
-            return message.hasKey() ? message.getKey() : null;
+        public Object getData(RawMessage message) {
+            return message.getKey().orElse(null);
         }
     }
 
@@ -121,7 +121,7 @@ public abstract class PulsarInternalColumn {
         }
 
         @Override
-        public Object getData(Message message) {
+        public Object getData(RawMessage message) {
             try {
                 return mapper.writeValueAsString(message.getProperties());
             } catch (JsonProcessingException e) {
@@ -134,8 +134,7 @@ public abstract class PulsarInternalColumn {
             .TIMESTAMP, "Application defined timestamp in milliseconds of when the event occurred");
 
     public static final PulsarInternalColumn PUBLISH_TIME = new PublishTimeColumn("__publish_time__",
-            TimestampWithTimeZoneType.TIMESTAMP_WITH_TIME_ZONE,
-            "The timestamp in milliseconds of when event as published");
+            TimestampType.TIMESTAMP, "The timestamp in milliseconds of when event as published");
 
     public static final PulsarInternalColumn MESSAGE_ID = new MessageIdColumn("__message_id__", VarcharType.VARCHAR,
             "The message ID of the message used to generate this row");
@@ -201,5 +200,5 @@ public abstract class PulsarInternalColumn {
         return builder.build();
     }
 
-    public abstract Object getData(Message message);
+    public abstract Object getData(RawMessage message);
 }

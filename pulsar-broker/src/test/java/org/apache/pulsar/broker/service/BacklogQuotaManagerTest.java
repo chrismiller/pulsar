@@ -19,15 +19,19 @@
 package org.apache.pulsar.broker.service;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
 
 import java.net.URL;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.bookkeeper.test.PortManager;
+import org.apache.pulsar.broker.ConfigHelper;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.client.admin.PulsarAdmin;
@@ -43,12 +47,10 @@ import org.apache.pulsar.common.policies.data.TenantInfo;
 import org.apache.pulsar.zookeeper.LocalBookkeeperEnsemble;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 /**
@@ -78,9 +80,9 @@ public class BacklogQuotaManagerTest {
             config = new ServiceConfiguration();
             config.setZookeeperServers("127.0.0.1" + ":" + ZOOKEEPER_PORT);
             config.setAdvertisedAddress("localhost");
-            config.setWebServicePort(BROKER_WEBSERVICE_PORT);
+            config.setWebServicePort(Optional.ofNullable(BROKER_WEBSERVICE_PORT));
             config.setClusterName("usc");
-            config.setBrokerServicePort(BROKER_SERVICE_PORT);
+            config.setBrokerServicePort(Optional.ofNullable(BROKER_SERVICE_PORT));
             config.setAuthorizationEnabled(false);
             config.setAuthenticationEnabled(false);
             config.setBacklogQuotaCheckIntervalInSeconds(TIME_TO_CHECK_BACKLOG_QUOTA);
@@ -104,7 +106,7 @@ public class BacklogQuotaManagerTest {
             admin.namespaces().setNamespaceReplicationClusters("prop/quotaholdasync", Sets.newHashSet("usc"));
         } catch (Throwable t) {
             LOG.error("Error setting up broker test", t);
-            Assert.fail("Broker test setup failed");
+            fail("Broker test setup failed");
         }
     }
 
@@ -116,7 +118,7 @@ public class BacklogQuotaManagerTest {
             bkEnsemble.stop();
         } catch (Throwable t) {
             LOG.error("Error cleaning up broker test setup state", t);
-            Assert.fail("Broker test cleanup failed");
+            fail("Broker test cleanup failed");
         }
     }
 
@@ -126,7 +128,8 @@ public class BacklogQuotaManagerTest {
 
     @Test
     public void testConsumerBacklogEviction() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/ns-quota",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.consumer_backlog_eviction));
         PulsarClient client = PulsarClient.builder().serviceUrl(adminUrl.toString()).statsInterval(0, TimeUnit.SECONDS)
@@ -151,13 +154,14 @@ public class BacklogQuotaManagerTest {
         rolloverStats();
 
         TopicStats stats = admin.topics().getStats(topic1);
-        Assert.assertTrue(stats.storageSize < 10 * 1024, "Storage size is [" + stats.storageSize + "]");
+        assertTrue(stats.storageSize < 10 * 1024, "Storage size is [" + stats.storageSize + "]");
         client.close();
     }
 
     @Test
     public void testConsumerBacklogEvictionWithAck() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/ns-quota",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.consumer_backlog_eviction));
         PulsarClient client = PulsarClient.builder().serviceUrl(adminUrl.toString()).build();
@@ -182,13 +186,14 @@ public class BacklogQuotaManagerTest {
         rolloverStats();
 
         TopicStats stats = admin.topics().getStats(topic1);
-        Assert.assertTrue(stats.storageSize <= 10 * 1024, "Storage size is [" + stats.storageSize + "]");
+        assertTrue(stats.storageSize <= 10 * 1024, "Storage size is [" + stats.storageSize + "]");
         client.close();
     }
 
     @Test
     public void testConcurrentAckAndEviction() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/ns-quota",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.consumer_backlog_eviction));
 
@@ -248,19 +253,20 @@ public class BacklogQuotaManagerTest {
 
         // test hangs without timeout since there is nothing to consume due to eviction
         counter.await(20, TimeUnit.SECONDS);
-        assertTrue(!gotException.get());
+        assertFalse(gotException.get());
         Thread.sleep((TIME_TO_CHECK_BACKLOG_QUOTA + 1) * 1000);
         rolloverStats();
 
         TopicStats stats = admin.topics().getStats(topic1);
-        Assert.assertTrue(stats.storageSize <= 10 * 1024, "Storage size is [" + stats.storageSize + "]");
+        assertTrue(stats.storageSize <= 10 * 1024, "Storage size is [" + stats.storageSize + "]");
         client.close();
         client2.close();
     }
 
     @Test
     public void testNoEviction() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/ns-quota",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.consumer_backlog_eviction));
 
@@ -318,14 +324,15 @@ public class BacklogQuotaManagerTest {
         producerThread.start();
         ConsumerThread.start();
         counter.await();
-        assertTrue(!gotException.get());
+        assertFalse(gotException.get());
         client.close();
         client2.close();
     }
 
     @Test
     public void testEvictionMulti() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/ns-quota"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/ns-quota",
                 new BacklogQuota(15 * 1024, BacklogQuota.RetentionPolicy.consumer_backlog_eviction));
 
@@ -420,12 +427,12 @@ public class BacklogQuotaManagerTest {
         ConsumerThread1.start();
         ConsumerThread2.start();
         counter.await(20, TimeUnit.SECONDS);
-        assertTrue(!gotException.get());
+        assertFalse(gotException.get());
         Thread.sleep((TIME_TO_CHECK_BACKLOG_QUOTA + 1) * 1000);
         rolloverStats();
 
         TopicStats stats = admin.topics().getStats(topic1);
-        Assert.assertTrue(stats.storageSize <= 15 * 1024, "Storage size is [" + stats.storageSize + "]");
+        assertTrue(stats.storageSize <= 15 * 1024, "Storage size is [" + stats.storageSize + "]");
         client.close();
         client2.close();
         client3.close();
@@ -433,7 +440,8 @@ public class BacklogQuotaManagerTest {
 
     @Test
     public void testAheadProducerOnHold() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/quotahold",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.producer_request_hold));
         final PulsarClient client = PulsarClient.builder().serviceUrl(adminUrl.toString())
@@ -464,14 +472,15 @@ public class BacklogQuotaManagerTest {
         Thread.sleep((TIME_TO_CHECK_BACKLOG_QUOTA + 1) * 1000);
         rolloverStats();
         TopicStats stats = admin.topics().getStats(topic1);
-        Assert.assertEquals(stats.publishers.size(), 0,
+        assertEquals(stats.publishers.size(), 0,
                 "Number of producers on topic " + topic1 + " are [" + stats.publishers.size() + "]");
         client.close();
     }
 
     @Test
     public void testAheadProducerOnHoldTimeout() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/quotahold",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.producer_request_hold));
         final PulsarClient client = PulsarClient.builder().serviceUrl(adminUrl.toString())
@@ -494,18 +503,19 @@ public class BacklogQuotaManagerTest {
             // try to send over backlog quota and make sure it fails
             producer.send(content);
             producer.send(content);
-            Assert.fail("backlog quota did not exceed");
+            fail("backlog quota did not exceed");
         } catch (PulsarClientException.TimeoutException te) {
             gotException = true;
         }
 
-        Assert.assertTrue(gotException, "timeout did not occur");
+        assertTrue(gotException, "timeout did not occur");
         client.close();
     }
 
     @Test
     public void testProducerException() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/quotahold",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.producer_exception));
         final PulsarClient client = PulsarClient.builder().serviceUrl(adminUrl.toString())
@@ -528,20 +538,21 @@ public class BacklogQuotaManagerTest {
             // try to send over backlog quota and make sure it fails
             producer.send(content);
             producer.send(content);
-            Assert.fail("backlog quota did not exceed");
+            fail("backlog quota did not exceed");
         } catch (PulsarClientException ce) {
-            Assert.assertTrue(ce instanceof PulsarClientException.ProducerBlockedQuotaExceededException
+            assertTrue(ce instanceof PulsarClientException.ProducerBlockedQuotaExceededException
                     || ce instanceof PulsarClientException.TimeoutException, ce.getMessage());
             gotException = true;
         }
 
-        Assert.assertTrue(gotException, "backlog exceeded exception did not occur");
+        assertTrue(gotException, "backlog exceeded exception did not occur");
         client.close();
     }
 
     @Test
     public void testProducerExceptionAndThenUnblock() throws Exception {
-        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"), Maps.newTreeMap());
+        assertEquals(admin.namespaces().getBacklogQuotaMap("prop/quotahold"),
+                ConfigHelper.backlogQuotaMap(config));
         admin.namespaces().setBacklogQuota("prop/quotahold",
                 new BacklogQuota(10 * 1024, BacklogQuota.RetentionPolicy.producer_exception));
         final PulsarClient client = PulsarClient.builder().serviceUrl(adminUrl.toString())
@@ -564,14 +575,14 @@ public class BacklogQuotaManagerTest {
             // try to send over backlog quota and make sure it fails
             producer.send(content);
             producer.send(content);
-            Assert.fail("backlog quota did not exceed");
+            fail("backlog quota did not exceed");
         } catch (PulsarClientException ce) {
-            Assert.assertTrue(ce instanceof PulsarClientException.ProducerBlockedQuotaExceededException
+            assertTrue(ce instanceof PulsarClientException.ProducerBlockedQuotaExceededException
                     || ce instanceof PulsarClientException.TimeoutException, ce.getMessage());
             gotException = true;
         }
 
-        Assert.assertTrue(gotException, "backlog exceeded exception did not occur");
+        assertTrue(gotException, "backlog exceeded exception did not occur");
         // now remove backlog and ensure that producer is unblockedrolloverStats();
 
         TopicStats stats = admin.topics().getStats(topic1);
@@ -593,7 +604,7 @@ public class BacklogQuotaManagerTest {
             gotException = true;
             sendException = e;
         }
-        Assert.assertFalse(gotException, "unable to publish due to " + sendException);
+        assertFalse(gotException, "unable to publish due to " + sendException);
         client.close();
     }
 

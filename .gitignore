@@ -20,6 +20,7 @@ pulsar-broker/src/test/resources/pulsar-functions-api-examples.jar
 .project
 .settings/
 .recommenders/
+.factorypath
 
 # Intellij
 .idea/
@@ -59,10 +60,8 @@ deployment/terraform-ansible/aws/terraform.tfstate.backup
 **/.vagrant
 
 
-pulsar-client-cpp/python/pkg/osx/**/*.bak
-pulsar-client-cpp/python/pkg/osx/**/build.sh
-pulsar-client-cpp/python/pkg/osx/**/*.whl
-pulsar-client-cpp/python/pkg/osx/**/*.template2
+pulsar-client-cpp/python/pkg/osx/*/*.bak
+pulsar-client-cpp/python/pkg/osx/*/*.whl
 pulsar-client-cpp/python/wheelhouse
 
 # CI generated files
@@ -77,3 +76,8 @@ docker.debug-info
 
 **/website/i18n/*
 **/website/translated_docs*
+
+# Avro
+examples/flink/src/main/java/org/apache/flink/avro/generated
+pulsar-flink/src/test/java/org/apache/flink/avro/generated
+pulsar-client/src/test/java/org/apache/pulsar/client/avro/generated

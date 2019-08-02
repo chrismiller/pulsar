@@ -23,6 +23,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.client.api.CompressionType;
 import org.apache.pulsar.client.api.HashingScheme;
+import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.MessageRoutingMode;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.ProducerBuilder;
@@ -30,12 +31,13 @@ import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.client.api.TypedMessageBuilder;
+import org.apache.pulsar.common.functions.FunctionConfig;
 import org.apache.pulsar.functions.api.Record;
 import org.apache.pulsar.functions.instance.FunctionResultRouter;
 import org.apache.pulsar.functions.instance.SinkRecord;
+import org.apache.pulsar.functions.instance.stats.ComponentStatsManager;
 import org.apache.pulsar.functions.source.PulsarRecord;
 import org.apache.pulsar.functions.source.TopicSchema;
-import org.apache.pulsar.common.functions.FunctionConfig;
 import org.apache.pulsar.functions.utils.Reflections;
 import org.apache.pulsar.io.core.Sink;
 import org.apache.pulsar.io.core.SinkContext;
@@ -48,24 +50,27 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 @Slf4j
 public class PulsarSink<T> implements Sink<T> {
 
     private final PulsarClient client;
     private final PulsarSinkConfig pulsarSinkConfig;
+    private final Map<String, String> properties;
+    private final ClassLoader functionClassLoader;
+    private ComponentStatsManager stats;
 
     @VisibleForTesting
     PulsarSinkProcessor<T> pulsarSinkProcessor;
 
     private final TopicSchema topicSchema;
-    private final String fqfn;
 
     private interface PulsarSinkProcessor<T> {
 
-        TypedMessageBuilder<T> newMessage(Record<T> record) throws Exception;
+        TypedMessageBuilder<T> newMessage(Record<T> record);
 
-        void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record) throws Exception;
+        void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record);
 
         void close() throws Exception;
     }
@@ -78,24 +83,25 @@ public class PulsarSink<T> implements Sink<T> {
             this.schema = schema;
         }
 
-        public <T> Producer<T> createProducer(PulsarClient client, String topic, String producerName, Schema<T> schema, String fqfn)
+        public <T> Producer<T> createProducer(PulsarClient client, String topic, String producerName, Schema<T> schema)
                 throws PulsarClientException {
             ProducerBuilder<T> builder = client.newProducer(schema)
                     .blockIfQueueFull(true)
                     .enableBatching(true)
-                    .batchingMaxPublishDelay(1, TimeUnit.MILLISECONDS)
+                    .batchingMaxPublishDelay(10, TimeUnit.MILLISECONDS)
                     .compressionType(CompressionType.LZ4)
                     .hashingScheme(HashingScheme.Murmur3_32Hash) //
                     .messageRoutingMode(MessageRoutingMode.CustomPartition)
                     .messageRouter(FunctionResultRouter.of())
+                    // set send timeout to be infinity to prevent potential deadlock with consumer
+                    // that might happen when consumer is blocked due to unacked messages
+                    .sendTimeout(0, TimeUnit.SECONDS)
                     .topic(topic);
             if (producerName != null) {
                 builder.producerName(producerName);
             }
 
-            return builder
-                    .property("application", "pulsarfunction")
-                    .property("fqfn", fqfn).create();
+            return builder.properties(properties).create();
         }
 
         protected Producer<T> getProducer(String destinationTopic) {
@@ -109,8 +115,7 @@ public class PulsarSink<T> implements Sink<T> {
                             client,
                             topicName,
                             producerName,
-                            schema,
-                            fqfn);
+                            schema);
                 } catch (PulsarClientException e) {
                     log.error("Failed to create Producer while doing user publish", e);
                     throw new RuntimeException(e);
@@ -131,6 +136,30 @@ public class PulsarSink<T> implements Sink<T> {
                 log.warn("Failed to close all the producers", e);
             }
         }
+
+        public Function<Throwable, Void> getPublishErrorHandler(Record<T> record, boolean failSource) {
+
+            return throwable -> {
+                SinkRecord<T> sinkRecord = (SinkRecord<T>) record;
+                Record<T> srcRecord = sinkRecord.getSourceRecord();
+                if (failSource) {
+                    srcRecord.fail();
+                }
+
+                String topic = record.getDestinationTopic().orElse(pulsarSinkConfig.getTopic());
+
+                String errorMsg = null;
+                if (srcRecord instanceof PulsarRecord) {
+                    errorMsg = String.format("Failed to publish to topic [%s] with error [%s] with src message id [%s]", topic, throwable.getMessage(), ((PulsarRecord) srcRecord).getMessageId());
+                    log.error(errorMsg);
+                } else {
+                    errorMsg = String.format("Failed to publish to topic [%s] with error [%s] with src sequence id [%s]", topic, throwable.getMessage(), record.getRecordSequence().get());
+                    log.error(errorMsg);
+                }
+                stats.incrSinkExceptions(new Exception(errorMsg));
+                return null;
+            };
+        }
     }
 
     @VisibleForTesting
@@ -140,7 +169,7 @@ public class PulsarSink<T> implements Sink<T> {
             // initialize default topic
             try {
                 publishProducers.put(pulsarSinkConfig.getTopic(),
-                        createProducer(client, pulsarSinkConfig.getTopic(), null, schema, fqfn));
+                        createProducer(client, pulsarSinkConfig.getTopic(), null, schema));
             } catch (PulsarClientException e) {
                 log.error("Failed to create Producer while doing user publish", e);
                 throw new RuntimeException(e);            }
@@ -152,8 +181,10 @@ public class PulsarSink<T> implements Sink<T> {
         }
 
         @Override
-        public void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record) throws Exception {
-            msg.sendAsync();
+        public void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record) {
+            msg.sendAsync().thenAccept(messageId -> {
+                //no op
+            }).exceptionally(getPublishErrorHandler(record, false));
         }
     }
 
@@ -164,21 +195,22 @@ public class PulsarSink<T> implements Sink<T> {
         }
 
         @Override
-        public void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record) throws Exception {
-            msg.sendAsync().thenAccept(messageId -> record.ack());
+        public void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record) {
+            msg.sendAsync()
+                    .thenAccept(messageId -> record.ack())
+                    .exceptionally(getPublishErrorHandler(record, true));
         }
     }
 
     @VisibleForTesting
     class PulsarSinkEffectivelyOnceProcessor extends PulsarSinkProcessorBase {
 
-
         public PulsarSinkEffectivelyOnceProcessor(Schema schema) {
             super(schema);
         }
 
         @Override
-        public TypedMessageBuilder<T> newMessage(Record<T> record) throws Exception {
+        public TypedMessageBuilder<T> newMessage(Record<T> record) {
             if (!record.getPartitionId().isPresent()) {
                 throw new RuntimeException("PartitionId needs to be specified for every record while in Effectively-once mode");
             }
@@ -191,8 +223,7 @@ public class PulsarSink<T> implements Sink<T> {
         }
 
         @Override
-        public void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record)
-                throws Exception {
+        public void sendOutputMessage(TypedMessageBuilder<T> msg, Record<T> record) {
 
             if (!record.getRecordSequence().isPresent()) {
                 throw new RuntimeException("RecordSequence needs to be specified for every record while in Effectively-once mode");
@@ -200,17 +231,21 @@ public class PulsarSink<T> implements Sink<T> {
 
             // assign sequence id to output message for idempotent producing
             msg.sequenceId(record.getRecordSequence().get());
-            msg.sendAsync()
-                    .thenAccept(messageId -> record.ack())
-                    .join();
+            CompletableFuture<MessageId> future = msg.sendAsync();
+
+            future.thenAccept(messageId -> record.ack()).exceptionally(getPublishErrorHandler(record, true));
+            future.join();
         }
     }
 
-    public PulsarSink(PulsarClient client, PulsarSinkConfig pulsarSinkConfig, String fqfn) {
+    public PulsarSink(PulsarClient client, PulsarSinkConfig pulsarSinkConfig, Map<String, String> properties,
+                      ComponentStatsManager stats, ClassLoader functionClassLoader) {
         this.client = client;
         this.pulsarSinkConfig = pulsarSinkConfig;
         this.topicSchema = new TopicSchema(client);
-        this.fqfn = fqfn;
+        this.properties = properties;
+        this.stats = stats;
+        this.functionClassLoader = functionClassLoader;
     }
 
     @Override
@@ -238,7 +273,7 @@ public class PulsarSink<T> implements Sink<T> {
     }
 
     @Override
-    public void write(Record<T> record) throws Exception {
+    public void write(Record<T> record) {
         TypedMessageBuilder<T> msg = pulsarSinkProcessor.newMessage(record);
         if (record.getKey().isPresent()) {
             msg.key(record.getKey().get());
@@ -282,9 +317,7 @@ public class PulsarSink<T> implements Sink<T> {
             return (Schema<T>) Schema.BYTES;
         }
 
-        Class<?> typeArg = Reflections.loadClass(this.pulsarSinkConfig.getTypeClassName(),
-                Thread.currentThread().getContextClassLoader());
-
+        Class<?> typeArg = Reflections.loadClass(this.pulsarSinkConfig.getTypeClassName(), functionClassLoader);
         if (Void.class.equals(typeArg)) {
             // return type is 'void', so there's no schema to check
             return null;

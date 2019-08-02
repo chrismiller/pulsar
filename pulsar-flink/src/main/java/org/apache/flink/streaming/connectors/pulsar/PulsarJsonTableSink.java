@@ -20,9 +20,11 @@ package org.apache.flink.streaming.connectors.pulsar;
 
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
-import org.apache.flink.streaming.connectors.pulsar.serde.JsonRowSerializationSchema;
+import org.apache.flink.formats.json.JsonRowSerializationSchema;
 import org.apache.flink.types.Row;
-import org.apache.pulsar.client.api.ProducerConfiguration;
+import org.apache.pulsar.client.api.Authentication;
+import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
+import org.apache.pulsar.client.impl.conf.ProducerConfigurationData;
 
 /**
  * Base class for {@link PulsarTableSink} that serializes data in JSON format.
@@ -34,15 +36,22 @@ public class PulsarJsonTableSink extends PulsarTableSink {
      *
      * @param serviceUrl          pulsar service url
      * @param topic               topic in pulsar to which table is written
-     * @param producerConf        producer configuration
+     * @param authentication      authetication info required by pulsar client
      * @param routingKeyFieldName routing key field name
      */
     public PulsarJsonTableSink(
             String serviceUrl,
             String topic,
-            ProducerConfiguration producerConf,
+            Authentication authentication,
             String routingKeyFieldName) {
-        super(serviceUrl, topic, producerConf, routingKeyFieldName);
+        super(serviceUrl, topic, authentication, routingKeyFieldName);
+    }
+
+    public PulsarJsonTableSink(
+            ClientConfigurationData clientConfigurationData,
+            ProducerConfigurationData producerConfigurationData,
+            String routingKeyFieldName) {
+        super(clientConfigurationData, producerConfigurationData, routingKeyFieldName);
     }
 
     @Override
@@ -53,9 +62,8 @@ public class PulsarJsonTableSink extends PulsarTableSink {
     @Override
     protected PulsarTableSink createSink() {
         return new PulsarJsonTableSink(
-                serviceUrl,
-                topic,
-                producerConf,
+                clientConfigurationData,
+                producerConfigurationData,
                 routingKeyFieldName);
     }
 }

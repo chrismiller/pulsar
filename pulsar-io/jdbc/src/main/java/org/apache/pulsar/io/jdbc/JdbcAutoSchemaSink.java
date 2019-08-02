@@ -20,29 +20,48 @@
 package org.apache.pulsar.io.jdbc;
 
 import java.sql.PreparedStatement;
+import java.util.List;
+
+import com.google.common.collect.Lists;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pulsar.client.api.schema.GenericRecord;
 import org.apache.pulsar.functions.api.Record;
+import org.apache.pulsar.io.core.annotations.Connector;
+import org.apache.pulsar.io.core.annotations.IOType;
 import org.apache.pulsar.io.jdbc.JdbcUtils.ColumnId;
 
 /**
  * A Simple Jdbc sink, which interprets input Record in generic record.
  */
+@Connector(
+    name = "jdbc",
+    type = IOType.SINK,
+    help = "A simple JDBC sink that writes pulsar messages to a database table",
+    configClass = JdbcSinkConfig.class
+)
 @Slf4j
 public class JdbcAutoSchemaSink extends JdbcAbstractSink<GenericRecord> {
 
     @Override
     public void bindValue(PreparedStatement statement,
-                          Record<GenericRecord> message) throws Exception {
+                          Record<GenericRecord> message, String action) throws Exception {
 
         GenericRecord record = message.getValue();
+        List<ColumnId> columns = Lists.newArrayList();
+        if (action == null || action.equals(INSERT)) {
+            columns = tableDefinition.getColumns();
+        } else if (action.equals(DELETE)){
+            columns.addAll(tableDefinition.getKeyColumns());
+        } else if (action.equals(UPDATE)){
+            columns.addAll(tableDefinition.getNonKeyColumns());
+            columns.addAll(tableDefinition.getKeyColumns());
+        }
 
         int index = 1;
-        for (ColumnId columnId : tableDefinition.getColumns()) {
+        for (ColumnId columnId : columns) {
             String colName = columnId.getName();
             Object obj = record.getField(colName);
             setColumnValue(statement, index++, obj);
-            log.info("set column value: {}", obj.toString());
         }
     }
 
@@ -58,7 +77,7 @@ public class JdbcAutoSchemaSink extends JdbcAbstractSink<GenericRecord> {
         } else if (value instanceof Boolean) {
             statement.setBoolean(index, (Boolean) value);
         } else if (value instanceof String) {
-            statement.setString(index, (String )value);
+            statement.setString(index, (String)value);
         } else if (value instanceof Short) {
             statement.setShort(index, (Short) value);
         } else {

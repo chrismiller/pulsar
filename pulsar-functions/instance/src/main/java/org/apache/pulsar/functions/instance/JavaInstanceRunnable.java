@@ -19,11 +19,11 @@
 
 package org.apache.pulsar.functions.instance;
 
+import com.google.common.base.Stopwatch;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import io.netty.buffer.ByteBuf;
 import io.prometheus.client.CollectorRegistry;
-import io.prometheus.client.Summary;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -33,8 +33,12 @@ import org.apache.bookkeeper.api.kv.Table;
 import org.apache.bookkeeper.clients.StorageClientBuilder;
 import org.apache.bookkeeper.clients.admin.StorageAdminClient;
 import org.apache.bookkeeper.clients.config.StorageClientSettings;
+import org.apache.bookkeeper.clients.exceptions.ClientException;
+import org.apache.bookkeeper.clients.exceptions.InternalServerException;
 import org.apache.bookkeeper.clients.exceptions.NamespaceNotFoundException;
 import org.apache.bookkeeper.clients.exceptions.StreamNotFoundException;
+import org.apache.bookkeeper.common.util.Backoff.Jitter;
+import org.apache.bookkeeper.common.util.Backoff.Jitter.Type;
 import org.apache.bookkeeper.stream.proto.NamespaceConfiguration;
 import org.apache.bookkeeper.stream.proto.StorageType;
 import org.apache.bookkeeper.stream.proto.StreamConfiguration;
@@ -51,6 +55,7 @@ import org.apache.pulsar.common.functions.FunctionConfig;
 import org.apache.pulsar.functions.api.Function;
 import org.apache.pulsar.functions.api.Record;
 import org.apache.pulsar.functions.instance.state.StateContextImpl;
+import org.apache.pulsar.functions.instance.stats.ComponentStatsManager;
 import org.apache.pulsar.functions.proto.Function.SinkSpec;
 import org.apache.pulsar.functions.proto.Function.SourceSpec;
 import org.apache.pulsar.functions.proto.InstanceCommunication;
@@ -61,9 +66,8 @@ import org.apache.pulsar.functions.sink.PulsarSinkConfig;
 import org.apache.pulsar.functions.sink.PulsarSinkDisable;
 import org.apache.pulsar.functions.source.PulsarSource;
 import org.apache.pulsar.functions.source.PulsarSourceConfig;
-import org.apache.pulsar.functions.utils.FunctionDetailsUtils;
 import org.apache.pulsar.functions.utils.Reflections;
-import org.apache.pulsar.functions.utils.StateUtils;
+import org.apache.pulsar.functions.utils.FunctionCommon;
 import org.apache.pulsar.functions.utils.functioncache.FunctionCacheManager;
 import org.apache.pulsar.io.core.Sink;
 import org.apache.pulsar.io.core.Source;
@@ -74,8 +78,8 @@ import java.io.FileNotFoundException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.bookkeeper.common.concurrent.FutureUtils.result;
 import static org.apache.bookkeeper.stream.protocol.ProtocolConstants.DEFAULT_STREAM_CONF;
@@ -86,8 +90,6 @@ import static org.apache.bookkeeper.stream.protocol.ProtocolConstants.DEFAULT_ST
 @Slf4j
 public class JavaInstanceRunnable implements AutoCloseable, Runnable {
 
-    // The class loader that used for loading functions
-    private ClassLoader fnClassLoader;
     private final InstanceConfig instanceConfig;
     private final FunctionCacheManager fnCache;
     private final String jarFile;
@@ -109,7 +111,8 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
     private Throwable deathException;
 
     // function stats
-    private final FunctionStatsManager stats;
+    @Getter
+    private ComponentStatsManager stats;
 
     private Record<?> currentRecord;
 
@@ -120,6 +123,15 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
 
     private CollectorRegistry collectorRegistry;
     private final String[] metricsLabels;
+
+    private InstanceCache instanceCache;
+
+    private final org.apache.pulsar.functions.proto.Function.FunctionDetails.ComponentType componentType;
+
+    private final Map<String, String> properties;
+
+    private final ClassLoader instanceClassLoader;
+    private ClassLoader functionClassLoader;
 
     public JavaInstanceRunnable(InstanceConfig instanceConfig,
                                 FunctionCacheManager fnCache,
@@ -133,27 +145,38 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         this.jarFile = jarFile;
         this.client = (PulsarClientImpl) pulsarClient;
         this.stateStorageServiceUrl = stateStorageServiceUrl;
-        this.stats = new FunctionStatsManager(collectorRegistry);
         this.secretsProvider = secretsProvider;
         this.collectorRegistry = collectorRegistry;
         this.metricsLabels = new String[]{
                 instanceConfig.getFunctionDetails().getTenant(),
                 String.format("%s/%s", instanceConfig.getFunctionDetails().getTenant(),
                         instanceConfig.getFunctionDetails().getNamespace()),
-                String.format("%s/%s/%s", instanceConfig.getFunctionDetails().getTenant(),
-                        instanceConfig.getFunctionDetails().getNamespace(),
-                        instanceConfig.getFunctionDetails().getName()),
+                instanceConfig.getFunctionDetails().getName(),
                 String.valueOf(instanceConfig.getInstanceId()),
-                instanceConfig.getClusterName()
+                instanceConfig.getClusterName(),
+                FunctionCommon.getFullyQualifiedName(instanceConfig.getFunctionDetails())
         };
+
+        this.componentType = InstanceUtils.calculateSubjectType(instanceConfig.getFunctionDetails());
+
+        this.properties = InstanceUtils.getProperties(this.componentType,
+                FunctionCommon.getFullyQualifiedName(instanceConfig.getFunctionDetails()),
+                this.instanceConfig.getInstanceId());
+
+        // Declare function local collector registry so that it will not clash with other function instances'
+        // metrics collection especially in threaded mode
+        // In process mode the JavaInstanceMain will declare a CollectorRegistry and pass it down
+        this.collectorRegistry = collectorRegistry;
+
+        this.instanceClassLoader = Thread.currentThread().getContextClassLoader();
     }
 
     /**
      * NOTE: this method should be called in the instance thread, in order to make class loading work.
      */
-    JavaInstance setupJavaInstance(ContextImpl contextImpl) throws Exception {
+    JavaInstance setupJavaInstance() throws Exception {
         // initialize the thread context
-        ThreadContext.put("function", FunctionDetailsUtils.getFullyQualifiedName(instanceConfig.getFunctionDetails()));
+        ThreadContext.put("function", FunctionCommon.getFullyQualifiedName(instanceConfig.getFunctionDetails()));
         ThreadContext.put("functionname", instanceConfig.getFunctionDetails().getName());
         ThreadContext.put("instance", instanceConfig.getInstanceName());
 
@@ -161,18 +184,21 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
             instanceConfig.getFunctionDetails().getName(), instanceConfig.getFunctionDetails());
 
         // start the function thread
-        loadJars();
+        functionClassLoader = loadJars();
 
-        ClassLoader clsLoader = Thread.currentThread().getContextClassLoader();
         Object object = Reflections.createInstance(
                 instanceConfig.getFunctionDetails().getClassName(),
-                clsLoader);
+                functionClassLoader);
+
         if (!(object instanceof Function) && !(object instanceof java.util.function.Function)) {
             throw new RuntimeException("User class must either be Function or java.util.Function");
         }
 
         // start the state table
         setupStateTable();
+
+        ContextImpl contextImpl = setupContext();
+
         // start the output producer
         setupOutput(contextImpl);
         // start the input consumer
@@ -184,25 +210,28 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
     }
 
     ContextImpl setupContext() {
-        List<String> inputTopics = null;
-        if (source instanceof PulsarSource) {
-            inputTopics = ((PulsarSource<?>) source).getInputTopics();
-        }
         Logger instanceLog = LoggerFactory.getLogger(
                 "function-" + instanceConfig.getFunctionDetails().getName());
-        return new ContextImpl(instanceConfig, instanceLog, client, inputTopics, secretsProvider, collectorRegistry, metricsLabels);
+        return new ContextImpl(instanceConfig, instanceLog, client, secretsProvider,
+                collectorRegistry, metricsLabels, this.componentType, this.stats);
     }
 
     /**
-     * The core logic that initialize the instance thread and executes the function
+     * The core logic that initialize the instance thread and executes the function.
      */
     @Override
     public void run() {
-        String functionName = null;
         try {
-            ContextImpl contextImpl = setupContext();
-            functionName = String.format("%s-%s", contextImpl.getTenant(), contextImpl.getFunctionName());
-            javaInstance = setupJavaInstance(contextImpl);
+            this.instanceCache = InstanceCache.getInstanceCache();
+
+            if (this.collectorRegistry == null) {
+                this.collectorRegistry = new CollectorRegistry();
+            }
+            this.stats = ComponentStatsManager.getStatsManager(this.collectorRegistry, this.metricsLabels,
+                    this.instanceCache.getScheduledExecutorService(),
+                    this.componentType);
+
+            javaInstance = setupJavaInstance();
             if (null != stateTable) {
                 StateContextImpl stateContext = new StateContextImpl(stateTable);
                 javaInstance.getContext().setStateContext(stateContext);
@@ -211,7 +240,7 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
                 currentRecord = readInput();
 
                 // increment number of records received from source
-                stats.statTotalRecordsRecieved.labels(metricsLabels).inc();
+                stats.incrTotalReceived();
 
                 if (instanceConfig.getFunctionDetails().getProcessingGuarantees() == org.apache.pulsar.functions
                         .proto.Function.ProcessingGuarantees.ATMOST_ONCE) {
@@ -224,18 +253,18 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
                 JavaExecutionResult result;
 
                 // set last invocation time
-                stats.statlastInvocation.labels(metricsLabels).set(System.currentTimeMillis());
+                stats.setLastInvocation(System.currentTimeMillis());
 
                 // start time for process latency stat
-                Summary.Timer requestTimer = stats.statProcessLatency.labels(metricsLabels).startTimer();
+                stats.processTimeStart();
 
                 // process the message
+                Thread.currentThread().setContextClassLoader(functionClassLoader);
                 result = javaInstance.handleMessage(currentRecord, currentRecord.getValue());
+                Thread.currentThread().setContextClassLoader(instanceClassLoader);
 
                 // register end time
-                requestTimer.observeDuration();
-                // increment total processed
-                stats.statTotalProcessed.labels(metricsLabels).inc();
+                stats.processTimeEnd();
 
                 removeLogTopicHandler();
 
@@ -251,10 +280,15 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
                 }
             }
         } catch (Throwable t) {
-            log.error("[{}] Uncaught exception in Java Instance", functionName, t);
+            log.error("[{}] Uncaught exception in Java Instance", FunctionCommon.getFullyQualifiedInstanceId(
+                    instanceConfig.getFunctionDetails().getTenant(),
+                    instanceConfig.getFunctionDetails().getNamespace(),
+                    instanceConfig.getFunctionDetails().getName(),
+                    instanceConfig.getInstanceId()), t);
             deathException = t;
-            stats.statTotalSysExceptions.labels(metricsLabels).inc();
-            stats.addSystemException(t);
+            if (stats != null) {
+                stats.incrSysExceptions(t);
+            }
             return;
         } finally {
             log.info("Closing instance");
@@ -262,8 +296,10 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         }
     }
 
-    private void loadJars() throws Exception {
+    private ClassLoader loadJars() throws Exception {
+        ClassLoader fnClassLoader;
         try {
+            log.info("Load JAR: {}", jarFile);
             // Let's first try to treat it as a nar archive
             fnCache.registerFunctionInstanceWithArchive(
                 instanceConfig.getFunctionId(),
@@ -281,13 +317,52 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         log.info("Initialize function class loader for function {} at function cache manager",
                 instanceConfig.getFunctionDetails().getName());
 
-        this.fnClassLoader = fnCache.getClassLoader(instanceConfig.getFunctionId());
+        fnClassLoader = fnCache.getClassLoader(instanceConfig.getFunctionId());
         if (null == fnClassLoader) {
             throw new Exception("No function class loader available.");
         }
 
-        // make sure the function class loader is accessible thread-locally
-        Thread.currentThread().setContextClassLoader(fnClassLoader);
+        return fnClassLoader;
+    }
+
+    private void createStateTable(String tableNs, String tableName, StorageClientSettings settings) throws Exception {
+        try (StorageAdminClient storageAdminClient = StorageClientBuilder.newBuilder()
+            .withSettings(settings)
+            .buildAdmin()) {
+            StreamConfiguration streamConf = StreamConfiguration.newBuilder(DEFAULT_STREAM_CONF)
+                .setInitialNumRanges(4)
+                .setMinNumRanges(4)
+                .setStorageType(StorageType.TABLE)
+                .build();
+            Stopwatch elapsedWatch = Stopwatch.createStarted();
+            while (elapsedWatch.elapsed(TimeUnit.MINUTES) < 1) {
+                try {
+                    result(storageAdminClient.getStream(tableNs, tableName));
+                    return;
+                } catch (NamespaceNotFoundException nnfe) {
+                    try {
+                        result(storageAdminClient.createNamespace(tableNs, NamespaceConfiguration.newBuilder()
+                            .setDefaultStreamConf(streamConf)
+                            .build()));
+                        result(storageAdminClient.createStream(tableNs, tableName, streamConf));
+                    } catch (Exception e) {
+                        // there might be two clients conflicting at creating table, so let's retrieve the table again
+                        // to make sure the table is created.
+                    }
+                } catch (StreamNotFoundException snfe) {
+                    try {
+                        result(storageAdminClient.createStream(tableNs, tableName, streamConf));
+                    } catch (Exception e) {
+                        // there might be two client conflicting at creating table, so let's retrieve it to make
+                        // sure the table is created.
+                    }
+                } catch (ClientException ce) {
+                    log.warn("Encountered issue on fetching state stable metadata, re-attempting in 100 milliseconds",
+                        ce.getMessage());
+                    TimeUnit.MILLISECONDS.sleep(100);
+                }
+            }
+        }
     }
 
     private void setupStateTable() throws Exception {
@@ -295,7 +370,7 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
             return;
         }
 
-        String tableNs = StateUtils.getStateNamespace(
+        String tableNs = FunctionCommon.getStateNamespace(
             instanceConfig.getFunctionDetails().getTenant(),
             instanceConfig.getFunctionDetails().getNamespace()
         );
@@ -304,43 +379,43 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         StorageClientSettings settings = StorageClientSettings.newBuilder()
                 .serviceUri(stateStorageServiceUrl)
                 .clientName("function-" + tableNs + "/" + tableName)
+                // configure a maximum 2 minutes jitter backoff for accessing table service
+                .backoffPolicy(Jitter.of(
+                    Type.EXPONENTIAL,
+                    100,
+                    2000,
+                    60
+                ))
                 .build();
 
         // we defer creation of the state table until a java instance is running here.
-        try (StorageAdminClient storageAdminClient = StorageClientBuilder.newBuilder()
-                .withSettings(settings)
-                .buildAdmin()) {
-            StreamConfiguration streamConf = StreamConfiguration.newBuilder(DEFAULT_STREAM_CONF)
-                .setInitialNumRanges(4)
-                .setMinNumRanges(4)
-                .setStorageType(StorageType.TABLE)
-                .build();
-            try {
-                result(storageAdminClient.getStream(tableNs, tableName));
-            } catch (NamespaceNotFoundException nnfe) {
-                result(storageAdminClient.createNamespace(tableNs, NamespaceConfiguration.newBuilder()
-                        .setDefaultStreamConf(streamConf)
-                        .build()));
-                result(storageAdminClient.createStream(tableNs, tableName, streamConf));
-            } catch (StreamNotFoundException snfe) {
-                result(storageAdminClient.createStream(tableNs, tableName, streamConf));
-            }
-        }
+        createStateTable(tableNs, tableName, settings);
 
         log.info("Starting state table for function {}", instanceConfig.getFunctionDetails().getName());
         this.storageClient = StorageClientBuilder.newBuilder()
                 .withSettings(settings)
                 .withNamespace(tableNs)
                 .build();
-        this.stateTable = result(storageClient.openTable(tableName));
+        // NOTE: this is a workaround until we bump bk version to 4.9.0
+        // table might just be created above, so it might not be ready for serving traffic
+        Stopwatch openSw = Stopwatch.createStarted();
+        while (openSw.elapsed(TimeUnit.MINUTES) < 1) {
+            try {
+                this.stateTable = result(storageClient.openTable(tableName));
+                break;
+            } catch (InternalServerException ise) {
+                log.warn("Encountered internal server on opening table '{}', re-attempt in 100 milliseconds : {}",
+                    tableName, ise.getMessage());
+                TimeUnit.MILLISECONDS.sleep(100);
+            }
+        }
     }
 
     private void processResult(Record srcRecord,
                                JavaExecutionResult result) throws Exception {
         if (result.getUserException() != null) {
             log.info("Encountered user exception when processing message {}", srcRecord, result.getUserException());
-            stats.statTotalUserExceptions.labels(metricsLabels).inc();
-            stats.addUserException(result.getUserException() );
+            stats.incrUserExceptions(result.getUserException());
             srcRecord.fail();
         } else {
             if (result.getResult() != null) {
@@ -352,26 +427,38 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
                 }
             }
             // increment total successfully processed
-            stats.statTotalProcessedSuccessfully.labels(metricsLabels).inc();
+            stats.incrTotalProcessedSuccessfully();
         }
     }
 
     private void sendOutputMessage(Record srcRecord, Object output) {
+        if (!(this.sink instanceof PulsarSink)) {
+            Thread.currentThread().setContextClassLoader(functionClassLoader);
+        }
         try {
             this.sink.write(new SinkRecord<>(srcRecord, output));
         } catch (Exception e) {
             log.info("Encountered exception in sink write: ", e);
+            stats.incrSinkExceptions(e);
             throw new RuntimeException(e);
+        } finally {
+            Thread.currentThread().setContextClassLoader(instanceClassLoader);
         }
     }
 
     private Record readInput() {
         Record record;
+        if (!(this.source instanceof PulsarSource)) {
+            Thread.currentThread().setContextClassLoader(functionClassLoader);
+        }
         try {
             record = this.source.read();
         } catch (Exception e) {
+            stats.incrSourceExceptions(e);
             log.info("Encountered exception in source read: ", e);
             throw new RuntimeException(e);
+        } finally {
+            Thread.currentThread().setContextClassLoader(instanceClassLoader);
         }
 
         // check record is valid
@@ -383,27 +470,49 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         return record;
     }
 
+    /**
+     * NOTE: this method is be syncrhonized because it is potentially called by two different places
+     *       one inside the run/finally clause and one inside the ThreadRuntime::stop
+     */
     @Override
-    public void close() {
+    synchronized public void close() {
+
+        if (stats != null) {
+            stats.close();
+            stats = null;
+        }
+
         if (source != null) {
+            if (!(this.source instanceof PulsarSource)) {
+                Thread.currentThread().setContextClassLoader(functionClassLoader);
+            }
             try {
                 source.close();
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 log.error("Failed to close source {}", instanceConfig.getFunctionDetails().getSource().getClassName(), e);
-
+            } finally {
+                Thread.currentThread().setContextClassLoader(instanceClassLoader);
             }
+            source = null;
         }
 
         if (sink != null) {
+            if (!(this.sink instanceof PulsarSink)) {
+                Thread.currentThread().setContextClassLoader(functionClassLoader);
+            }
             try {
                 sink.close();
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 log.error("Failed to close sink {}", instanceConfig.getFunctionDetails().getSource().getClassName(), e);
+            } finally {
+                Thread.currentThread().setContextClassLoader(instanceClassLoader);
             }
+            sink = null;
         }
 
         if (null != javaInstance) {
             javaInstance.close();
+            javaInstance = null;
         }
 
         // kill the state table
@@ -412,14 +521,22 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
             stateTable = null;
         }
         if (null != storageClient) {
-            storageClient.close();
+            storageClient.closeAsync()
+                .exceptionally(cause -> {
+                    log.warn("Failed to close state storage client", cause);
+                    return null;
+                });
+            storageClient = null;
         }
 
-        // once the thread quits, clean up the instance
-        fnCache.unregisterFunctionInstance(
-                instanceConfig.getFunctionId(),
-                instanceConfig.getInstanceName());
-        log.info("Unloading JAR files for function {}", instanceConfig);
+        if (instanceCache != null) {
+            // once the thread quits, clean up the instance
+            fnCache.unregisterFunctionInstance(
+                    instanceConfig.getFunctionId(),
+                    instanceConfig.getInstanceName());
+            log.info("Unloading JAR files for function {}", instanceConfig);
+            instanceCache = null;
+        }
     }
 
     public InstanceCommunication.MetricsData getAndResetMetrics() {
@@ -446,36 +563,46 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
 
     private Builder createMetricsDataBuilder() {
         InstanceCommunication.MetricsData.Builder bldr = InstanceCommunication.MetricsData.newBuilder();
+        if (stats != null) {
+            bldr.setProcessedSuccessfullyTotal((long) stats.getTotalProcessedSuccessfully());
+            bldr.setSystemExceptionsTotal((long) stats.getTotalSysExceptions());
+            bldr.setUserExceptionsTotal((long) stats.getTotalUserExceptions());
+            bldr.setReceivedTotal((long) stats.getTotalRecordsReceived());
+            bldr.setAvgProcessLatency(stats.getAvgProcessLatency());
+            bldr.setLastInvocation((long) stats.getLastInvocation());
 
-        bldr.setProcessedTotal((long) stats.statTotalProcessed.labels(metricsLabels).get());
-        bldr.setProcessedSuccessfullyTotal((long) stats.statTotalProcessedSuccessfully.labels(metricsLabels).get());
-        bldr.setSystemExceptionsTotal((long) stats.statTotalSysExceptions.labels(metricsLabels).get());
-        bldr.setUserExceptionsTotal((long) stats.statTotalUserExceptions.labels(metricsLabels).get());
-        bldr.setReceivedTotal((long) stats.statTotalRecordsRecieved.labels(metricsLabels).get());
-        bldr.setAvgProcessLatency(stats.statProcessLatency.labels(metricsLabels).get().count <= 0.0
-                ? 0 : stats.statProcessLatency.labels(metricsLabels).get().sum / stats.statProcessLatency.labels(metricsLabels).get().count);
-        bldr.setLastInvocation((long) stats.statlastInvocation.labels(metricsLabels).get());
+            bldr.setProcessedSuccessfullyTotal1Min((long) stats.getTotalProcessedSuccessfully1min());
+            bldr.setSystemExceptionsTotal1Min((long) stats.getTotalSysExceptions1min());
+            bldr.setUserExceptionsTotal1Min((long) stats.getTotalUserExceptions1min());
+            bldr.setReceivedTotal1Min((long) stats.getTotalRecordsReceived1min());
+            bldr.setAvgProcessLatency1Min(stats.getAvgProcessLatency1min());
+        }
 
         return bldr;
     }
 
     public InstanceCommunication.FunctionStatus.Builder getFunctionStatus() {
         InstanceCommunication.FunctionStatus.Builder functionStatusBuilder = InstanceCommunication.FunctionStatus.newBuilder();
-        functionStatusBuilder.setNumProcessed((long) stats.statTotalProcessed.labels(metricsLabels).get());
-        functionStatusBuilder.setNumSuccessfullyProcessed((long) stats.statTotalProcessedSuccessfully.labels(metricsLabels).get());
-        functionStatusBuilder.setNumUserExceptions((long) stats.statTotalUserExceptions.labels(metricsLabels).get());
-        stats.getLatestUserExceptions().forEach(ex -> {
-            functionStatusBuilder.addLatestUserExceptions(ex);
-        });
-        functionStatusBuilder.setNumSystemExceptions((long) stats.statTotalSysExceptions.labels(metricsLabels).get());
-        stats.getLatestSystemExceptions().forEach(ex -> {
-            functionStatusBuilder.addLatestSystemExceptions(ex);
-        });
-        functionStatusBuilder.setAverageLatency(
-                stats.statProcessLatency.labels(metricsLabels).get().count == 0.0
-                        ? 0 : stats.statProcessLatency.labels(metricsLabels).get().sum / stats.statProcessLatency
-                        .labels(metricsLabels).get().count);
-        functionStatusBuilder.setLastInvocationTime((long) stats.statlastInvocation.labels(metricsLabels).get());
+        if (stats != null) {
+            functionStatusBuilder.setNumReceived((long) stats.getTotalRecordsReceived());
+            functionStatusBuilder.setNumSuccessfullyProcessed((long) stats.getTotalProcessedSuccessfully());
+            functionStatusBuilder.setNumUserExceptions((long) stats.getTotalUserExceptions());
+            stats.getLatestUserExceptions().forEach(ex -> {
+                functionStatusBuilder.addLatestUserExceptions(ex);
+            });
+            functionStatusBuilder.setNumSystemExceptions((long) stats.getTotalSysExceptions());
+            stats.getLatestSystemExceptions().forEach(ex -> {
+                functionStatusBuilder.addLatestSystemExceptions(ex);
+            });
+            stats.getLatestSourceExceptions().forEach(ex -> {
+                functionStatusBuilder.addLatestSourceExceptions(ex);
+            });
+            stats.getLatestSinkExceptions().forEach(ex -> {
+                functionStatusBuilder.addLatestSinkExceptions(ex);
+            });
+            functionStatusBuilder.setAverageLatency(stats.getAvgProcessLatency());
+            functionStatusBuilder.setLastInvocationTime((long) stats.getLastInvocation());
+        }
         return functionStatusBuilder;
     }
 
@@ -483,7 +610,7 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         if (instanceConfig.getFunctionDetails().getLogTopic() != null &&
                 !instanceConfig.getFunctionDetails().getLogTopic().isEmpty()) {
             logAppender = new LogAppender(client, instanceConfig.getFunctionDetails().getLogTopic(),
-                    FunctionDetailsUtils.getFullyQualifiedName(instanceConfig.getFunctionDetails()));
+                    FunctionCommon.getFullyQualifiedName(instanceConfig.getFunctionDetails()));
             logAppender.start();
         }
     }
@@ -523,6 +650,9 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
                 } else if (conf.getSerdeClassName() != null && !conf.getSerdeClassName().isEmpty()) {
                     consumerConfig.setSerdeClassName(conf.getSerdeClassName());
                 }
+                if (conf.hasReceiverQueueSize()) {
+                    consumerConfig.setReceiverQueueSize(conf.getReceiverQueueSize().getValue());
+                }
                 pulsarSourceConfig.getTopicSchema().put(topic, consumerConfig);
             });
 
@@ -540,7 +670,7 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
 
             pulsarSourceConfig.setSubscriptionName(
                     StringUtils.isNotBlank(sourceSpec.getSubscriptionName()) ? sourceSpec.getSubscriptionName()
-                            : FunctionDetailsUtils.getFullyQualifiedName(this.instanceConfig.getFunctionDetails()));
+                            : InstanceUtils.getDefaultSubscriptionName(instanceConfig.getFunctionDetails()));
             pulsarSourceConfig.setProcessingGuarantees(
                     FunctionConfig.ProcessingGuarantees.valueOf(
                             this.instanceConfig.getFunctionDetails().getProcessingGuarantees().name()));
@@ -564,12 +694,11 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
                 pulsarSourceConfig.setMaxMessageRetries(this.instanceConfig.getFunctionDetails().getRetryDetails().getMaxMessageRetries());
                 pulsarSourceConfig.setDeadLetterTopic(this.instanceConfig.getFunctionDetails().getRetryDetails().getDeadLetterTopic());
             }
-            object = new PulsarSource(this.client, pulsarSourceConfig,
-                    FunctionDetailsUtils.getFullyQualifiedName(this.instanceConfig.getFunctionDetails()));
+            object = new PulsarSource(this.client, pulsarSourceConfig, this.properties, this.functionClassLoader);
         } else {
             object = Reflections.createInstance(
                     sourceSpec.getClassName(),
-                    Thread.currentThread().getContextClassLoader());
+                    this.functionClassLoader);
         }
 
         Class<?>[] typeArgs;
@@ -581,11 +710,22 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         }
         this.source = (Source<?>) object;
 
-        if (sourceSpec.getConfigs().isEmpty()) {
-            this.source.open(new HashMap<>(), contextImpl);
-        } else {
-            this.source.open(new Gson().fromJson(sourceSpec.getConfigs(),
-                    new TypeToken<Map<String, Object>>(){}.getType()), contextImpl);
+        if (!(this.source instanceof PulsarSource)) {
+            Thread.currentThread().setContextClassLoader(this.functionClassLoader);
+        }
+        try {
+            if (sourceSpec.getConfigs().isEmpty()) {
+                this.source.open(new HashMap<>(), contextImpl);
+            } else {
+                this.source.open(new Gson().fromJson(sourceSpec.getConfigs(),
+                        new TypeToken<Map<String, Object>>() {
+                        }.getType()), contextImpl);
+            }
+        } catch (Exception e) {
+            log.error("Source open produced uncaught exception: ", e);
+            throw e;
+        } finally {
+            Thread.currentThread().setContextClassLoader(this.instanceClassLoader);
         }
     }
 
@@ -611,13 +751,12 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
 
                 pulsarSinkConfig.setTypeClassName(sinkSpec.getTypeClassName());
 
-                object = new PulsarSink(this.client, pulsarSinkConfig,
-                        FunctionDetailsUtils.getFullyQualifiedName(this.instanceConfig.getFunctionDetails()));
+                object = new PulsarSink(this.client, pulsarSinkConfig, this.properties, this.stats, this.functionClassLoader);
             }
         } else {
             object = Reflections.createInstance(
                     sinkSpec.getClassName(),
-                    Thread.currentThread().getContextClassLoader());
+                    this.functionClassLoader);
         }
 
         if (object instanceof Sink) {
@@ -625,11 +764,23 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         } else {
             throw new RuntimeException("Sink does not implement correct interface");
         }
-        if (sinkSpec.getConfigs().isEmpty()) {
-            this.sink.open(new HashMap<>(), contextImpl);
-        } else {
-            this.sink.open(new Gson().fromJson(sinkSpec.getConfigs(),
-                    new TypeToken<Map<String, Object>>() {}.getType()), contextImpl);
+
+        if (!(this.sink instanceof PulsarSink)) {
+            Thread.currentThread().setContextClassLoader(this.functionClassLoader);
+        }
+        try {
+            if (sinkSpec.getConfigs().isEmpty()) {
+                this.sink.open(new HashMap<>(), contextImpl);
+            } else {
+                this.sink.open(new Gson().fromJson(sinkSpec.getConfigs(),
+                        new TypeToken<Map<String, Object>>() {
+                        }.getType()), contextImpl);
+            }
+        } catch (Exception e) {
+            log.error("Sink open produced uncaught exception: ", e);
+            throw e;
+        } finally {
+            Thread.currentThread().setContextClassLoader(this.instanceClassLoader);
         }
     }
 }

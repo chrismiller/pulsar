@@ -18,9 +18,6 @@
  */
 package org.apache.pulsar.client.impl;
 
-import static com.google.common.base.Preconditions.checkState;
-import static org.apache.pulsar.common.naming.TopicName.PARTITIONED_TOPIC_SUFFIX;
-
 import java.util.Objects;
 import org.apache.pulsar.client.api.MessageId;
 
@@ -60,6 +57,11 @@ public class TopicMessageIdImpl implements MessageId {
     @Override
     public byte[] toByteArray() {
         return messageId.toByteArray();
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(topicPartitionName, messageId);
     }
 
     @Override

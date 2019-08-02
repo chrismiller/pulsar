@@ -41,11 +41,14 @@ import java.util.stream.Collectors;
 import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Schema;
-import org.apache.pulsar.common.api.Commands;
+import org.apache.pulsar.client.impl.schema.KeyValueSchema;
+import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.api.EncryptionContext;
 import org.apache.pulsar.common.api.proto.PulsarApi;
 import org.apache.pulsar.common.api.proto.PulsarApi.KeyValue;
 import org.apache.pulsar.common.api.proto.PulsarApi.MessageMetadata;
+import org.apache.pulsar.common.schema.KeyValueEncodingType;
+import org.apache.pulsar.common.schema.SchemaType;
 
 public class MessageImpl<T> implements Message<T> {
 
@@ -58,6 +61,7 @@ public class MessageImpl<T> implements Message<T> {
 
     private String topic; // only set for incoming messages
     transient private Map<String, String> properties;
+    private final int redeliveryCount;
 
     // Constructor for out-going message
     static <T> MessageImpl<T> create(MessageMetadata.Builder msgMetadataBuilder, ByteBuffer payload, Schema<T> schema) {
@@ -81,10 +85,16 @@ public class MessageImpl<T> implements Message<T> {
 
     MessageImpl(String topic, MessageIdImpl messageId, MessageMetadata msgMetadata, ByteBuf payload,
                 Optional<EncryptionContext> encryptionCtx, ClientCnx cnx, Schema<T> schema) {
+        this(topic, messageId, msgMetadata, payload, encryptionCtx, cnx, schema, 0);
+    }
+
+    MessageImpl(String topic, MessageIdImpl messageId, MessageMetadata msgMetadata, ByteBuf payload,
+                Optional<EncryptionContext> encryptionCtx, ClientCnx cnx, Schema<T> schema, int redeliveryCount) {
         this.msgMetadataBuilder = MessageMetadata.newBuilder(msgMetadata);
         this.messageId = messageId;
         this.topic = topic;
         this.cnx = cnx;
+        this.redeliveryCount = redeliveryCount;
 
         // Need to make a copy since the passed payload is using a ref-count buffer that we don't know when could
         // release, since the Message is passed to the user. Also, the passed ByteBuf is coming from network and is
@@ -104,10 +114,17 @@ public class MessageImpl<T> implements Message<T> {
     MessageImpl(String topic, BatchMessageIdImpl batchMessageIdImpl, MessageMetadata msgMetadata,
                 PulsarApi.SingleMessageMetadata singleMessageMetadata, ByteBuf payload,
                 Optional<EncryptionContext> encryptionCtx, ClientCnx cnx, Schema<T> schema) {
+        this(topic, batchMessageIdImpl, msgMetadata, singleMessageMetadata, payload, encryptionCtx, cnx, schema, 0);
+    }
+
+    MessageImpl(String topic, BatchMessageIdImpl batchMessageIdImpl, MessageMetadata msgMetadata,
+                PulsarApi.SingleMessageMetadata singleMessageMetadata, ByteBuf payload,
+                Optional<EncryptionContext> encryptionCtx, ClientCnx cnx, Schema<T> schema, int redeliveryCount) {
         this.msgMetadataBuilder = MessageMetadata.newBuilder(msgMetadata);
         this.messageId = batchMessageIdImpl;
         this.topic = topic;
         this.cnx = cnx;
+        this.redeliveryCount = redeliveryCount;
 
         this.payload = Unpooled.copiedBuffer(payload);
         this.encryptionCtx = encryptionCtx;
@@ -131,7 +148,16 @@ public class MessageImpl<T> implements Message<T> {
             msgMetadataBuilder.setEventTime(singleMessageMetadata.getEventTime());
         }
 
+        if (singleMessageMetadata.hasSequenceId()) {
+            msgMetadataBuilder.setSequenceId(singleMessageMetadata.getSequenceId());
+        }
+
         this.schema = schema;
+    }
+
+    public MessageImpl(String topic, String msgId, Map<String, String> properties,
+            byte[] payload, Schema<T> schema) {
+        this(topic, msgId, properties, Unpooled.wrappedBuffer(payload), schema);
     }
 
     public MessageImpl(String topic, String msgId, Map<String, String> properties,
@@ -149,6 +175,7 @@ public class MessageImpl<T> implements Message<T> {
         this.payload = payload;
         this.properties = Collections.unmodifiableMap(properties);
         this.schema = schema;
+        this.redeliveryCount = 0;
     }
 
     public static MessageImpl<byte[]> deserialize(ByteBuf headersAndPayload) throws IOException {
@@ -171,11 +198,13 @@ public class MessageImpl<T> implements Message<T> {
         msgMetadataBuilder.setReplicatedFrom(cluster);
     }
 
+    @Override
     public boolean isReplicated() {
         checkNotNull(msgMetadataBuilder);
         return msgMetadataBuilder.hasReplicatedFrom();
     }
 
+    @Override
     public String getReplicatedFrom() {
         checkNotNull(msgMetadataBuilder);
         return msgMetadataBuilder.getReplicatedFrom();
@@ -214,8 +243,55 @@ public class MessageImpl<T> implements Message<T> {
     }
 
     @Override
+    public byte[] getSchemaVersion() {
+        if (msgMetadataBuilder != null && msgMetadataBuilder.hasSchemaVersion()) {
+            return msgMetadataBuilder.getSchemaVersion().toByteArray();
+        } else {
+            return null;
+        }
+    }
+
+    @Override
     public T getValue() {
-        return schema.decode(getData());
+        if (SchemaType.KEY_VALUE == schema.getSchemaInfo().getType()) {
+            if (schema.supportSchemaVersioning()) {
+                return getKeyValueBySchemaVersion();
+            } else {
+                return getKeyValue();
+            }
+        } else {
+            // check if the schema passed in from client supports schema versioning or not
+            // this is an optimization to only get schema version when necessary
+            if (schema.supportSchemaVersioning()) {
+                byte[] schemaVersion = getSchemaVersion();
+                if (null == schemaVersion) {
+                    return schema.decode(getData());
+                } else {
+                    return schema.decode(getData(), schemaVersion);
+                }
+            } else {
+                return schema.decode(getData());
+            }
+        }
+    }
+
+    private T getKeyValueBySchemaVersion() {
+        KeyValueSchema kvSchema = (KeyValueSchema) schema;
+        byte[] schemaVersion = getSchemaVersion();
+        if (kvSchema.getKeyValueEncodingType() == KeyValueEncodingType.SEPARATED) {
+            return (T) kvSchema.decode(getKeyBytes(), getData(), schemaVersion);
+        } else {
+            return schema.decode(getData(), schemaVersion);
+        }
+    }
+
+    private T getKeyValue() {
+        KeyValueSchema kvSchema = (KeyValueSchema) schema;
+        if (kvSchema.getKeyValueEncodingType() == KeyValueEncodingType.SEPARATED) {
+            return (T) kvSchema.decode(getKeyBytes(), getData(), null);
+        } else {
+            return schema.decode(getData());
+        }
     }
 
     public long getSequenceId() {
@@ -265,7 +341,7 @@ public class MessageImpl<T> implements Message<T> {
 
     @Override
     public String getProperty(String name) {
-        return properties.get(name);
+        return this.getProperties().get(name);
     }
 
     public MessageMetadata.Builder getMessageBuilder() {
@@ -305,6 +381,18 @@ public class MessageImpl<T> implements Message<T> {
         }
     }
 
+    @Override
+    public boolean hasOrderingKey() {
+        checkNotNull(msgMetadataBuilder);
+        return msgMetadataBuilder.hasOrderingKey();
+    }
+
+    @Override
+    public byte[] getOrderingKey() {
+        checkNotNull(msgMetadataBuilder);
+        return msgMetadataBuilder.getOrderingKey().toByteArray();
+    }
+
     public ClientCnx getCnx() {
         return cnx;
     }
@@ -323,6 +411,7 @@ public class MessageImpl<T> implements Message<T> {
 
     private MessageImpl(Handle<MessageImpl<?>> recyclerHandle) {
         this.recyclerHandle = recyclerHandle;
+        this.redeliveryCount = 0;
     }
 
     private Handle<MessageImpl<?>> recyclerHandle;
@@ -351,5 +440,10 @@ public class MessageImpl<T> implements Message<T> {
     @Override
     public Optional<EncryptionContext> getEncryptionCtx() {
         return encryptionCtx;
+    }
+
+    @Override
+    public int getRedeliveryCount() {
+        return redeliveryCount;
     }
 }

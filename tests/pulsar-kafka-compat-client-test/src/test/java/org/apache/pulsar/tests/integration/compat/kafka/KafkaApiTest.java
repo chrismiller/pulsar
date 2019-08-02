@@ -33,16 +33,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import lombok.Cleanup;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 
+import org.apache.avro.reflect.Nullable;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Partitioner;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.apache.kafka.common.serialization.IntegerSerializer;
@@ -51,11 +57,36 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.PulsarClient;
+import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.api.schema.SchemaDefinition;
+import org.apache.pulsar.client.impl.schema.AvroSchema;
+import org.apache.pulsar.client.impl.schema.JSONSchema;
+import org.apache.pulsar.client.impl.schema.StringSchema;
+import org.apache.pulsar.client.kafka.compat.PulsarKafkaSchema;
 import org.apache.pulsar.tests.integration.suites.PulsarStandaloneTestSuite;
+import org.testng.Assert;
 import org.testng.annotations.Test;
 
 @Slf4j
 public class KafkaApiTest extends PulsarStandaloneTestSuite {
+
+    @Data
+    @ToString
+    @EqualsAndHashCode
+    public static class Foo {
+        @Nullable
+        private String field1;
+        @Nullable
+        private String field2;
+        private int field3;
+    }
+
+    @Data
+    @ToString
+    @EqualsAndHashCode
+    public static class Bar {
+        private boolean field1;
+    }
 
     private static String getPlainTextServiceUrl() {
         return container.getPlainTextServiceUrl();
@@ -301,6 +332,132 @@ public class KafkaApiTest extends PulsarStandaloneTestSuite {
     }
 
     @Test
+    public void testExplicitPartitions() throws Exception {
+        String topic = "testExplicitPartitions";
+
+        // Create 8 partitions in topic
+        @Cleanup
+        PulsarAdmin admin = PulsarAdmin.builder().serviceHttpUrl(getHttpServiceUrl()).build();
+        admin.topics().createPartitionedTopic(topic, 8);
+
+        Properties producerProperties = new Properties();
+        producerProperties.put("bootstrap.servers", getPlainTextServiceUrl());
+        producerProperties.put("key.serializer", IntegerSerializer.class.getName());
+        producerProperties.put("value.serializer", StringSerializer.class.getName());
+
+        @Cleanup
+        Producer<Integer, String> producer = new KafkaProducer<>(producerProperties);
+
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getPlainTextServiceUrl());
+        props.put("group.id", "my-subscription-name");
+        props.put("enable.auto.commit", "true");
+        props.put("key.deserializer", StringDeserializer.class.getName());
+        props.put("value.deserializer", StringDeserializer.class.getName());
+
+        // Create Kakfa consumer and verify all messages came from intended partition
+        @Cleanup
+        Consumer<String, String> consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(Arrays.asList(topic));
+
+        int N = 8 * 3;
+
+        final int choosenPartition = 5;
+
+        for (int i = 0; i < N; i++) {
+            producer.send(new ProducerRecord<>(topic, choosenPartition, i, "hello-" + i));
+        }
+
+        producer.flush();
+
+        for (int i = 0; i < N;) {
+            ConsumerRecords<String, String> records = consumer.poll(100);
+            i += records.count();
+
+            records.forEach(record -> {
+                assertEquals(record.partition(), choosenPartition);
+            });
+        }
+
+        // No more messages for this consumer
+        ConsumerRecords<String, String> records = consumer.poll(100);
+        assertEquals(records.count(), 0);
+    }
+
+    public static class MyCustomPartitioner implements Partitioner {
+
+        static int USED_PARTITION = 3;
+
+        @Override
+        public void configure(Map<String, ?> conf) {
+            // Do nothing
+        }
+
+        @Override
+        public void close() {
+            // Do nothing
+        }
+
+        @Override
+        public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
+            // Dummy implementation that always return same partition
+            return USED_PARTITION;
+        }
+    }
+
+    @Test
+    public void testCustomRouter() throws Exception {
+        String topic = "testCustomRouter";
+
+        // Create 8 partitions in topic
+        @Cleanup
+        PulsarAdmin admin = PulsarAdmin.builder().serviceHttpUrl(getHttpServiceUrl()).build();
+        admin.topics().createPartitionedTopic(topic, 8);
+
+        Properties producerProperties = new Properties();
+        producerProperties.put("bootstrap.servers", getPlainTextServiceUrl());
+        producerProperties.put("key.serializer", IntegerSerializer.class.getName());
+        producerProperties.put("value.serializer", StringSerializer.class.getName());
+        producerProperties.put("partitioner.class", MyCustomPartitioner.class.getName());
+
+        @Cleanup
+        Producer<Integer, String> producer = new KafkaProducer<>(producerProperties);
+
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getPlainTextServiceUrl());
+        props.put("group.id", "my-subscription-name");
+        props.put("enable.auto.commit", "true");
+        props.put("key.deserializer", IntegerDeserializer.class.getName());
+        props.put("value.deserializer", StringDeserializer.class.getName());
+
+        // Create Kakfa consumer and verify all messages came from intended partition
+        @Cleanup
+        Consumer<Integer, String> consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(Arrays.asList(topic));
+
+        int N = 8 * 3;
+
+        for (int i = 0; i < N; i++) {
+            producer.send(new ProducerRecord<>(topic, i, "hello-" + i));
+        }
+
+        producer.flush();
+
+        for (int i = 0; i < N;) {
+            ConsumerRecords<Integer, String> records = consumer.poll(100);
+            i += records.count();
+
+            records.forEach(record -> {
+                assertEquals(record.partition(), MyCustomPartitioner.USED_PARTITION);
+            });
+        }
+
+        // No more messages for this consumer
+        ConsumerRecords<Integer, String> records = consumer.poll(100);
+        assertEquals(records.count(), 0);
+    }
+
+    @Test
     public void testConsumerSeek() throws Exception {
         String topic = "testConsumerSeek";
 
@@ -480,5 +637,253 @@ public class KafkaApiTest extends PulsarStandaloneTestSuite {
         }
 
         producer.close();
+    }
+
+    @Test
+    public void testProducerAvroSchemaWithPulsarKafkaClient() throws Exception {
+        String topic = "testProducerAvroSchemaWithPulsarKafkaClient";
+        AvroSchema<Bar> barSchema = AvroSchema.of(SchemaDefinition.<Bar>builder().withPojo(Bar.class).build());
+        AvroSchema<Foo> fooSchema = AvroSchema.of(SchemaDefinition.<Foo>builder().withPojo(Foo.class).build());
+        @Cleanup
+        PulsarClient pulsarClient = PulsarClient.builder().serviceUrl(getPlainTextServiceUrl()).build();
+        org.apache.pulsar.client.api.Consumer<byte[]> pulsarConsumer =
+                pulsarClient.newConsumer()
+                .topic(topic)
+                .subscriptionName("my-subscription")
+                .subscribe();
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getPlainTextServiceUrl());
+        props.put("key.serializer", IntegerSerializer.class.getName());
+        props.put("value.serializer", StringSerializer.class.getName());
+
+        Producer<Bar, Foo> producer = new KafkaProducer<>(props, barSchema, fooSchema);
+        for (int i = 0; i < 10; i++) {
+            Bar bar = new Bar();
+            bar.setField1(true);
+
+            Foo foo = new Foo();
+            foo.setField1("field1");
+            foo.setField2("field2");
+            foo.setField3(i);
+            producer.send(new ProducerRecord<Bar, Foo>(topic, bar, foo));
+        }
+        producer.flush();
+        producer.close();
+
+        for (int i = 0; i < 10; i++) {
+            Message<byte[]> msg = pulsarConsumer.receive(1, TimeUnit.SECONDS);
+            Foo value = fooSchema.decode(msg.getValue());
+            Assert.assertEquals(value.getField1(), "field1");
+            Assert.assertEquals(value.getField2(), "field2");
+            Assert.assertEquals(value.getField3(), i);
+            pulsarConsumer.acknowledge(msg);
+        }
+    }
+
+    @Test
+    public void testConsumerAvroSchemaWithPulsarKafkaClient() throws Exception {
+        String topic = "testConsumerAvroSchemaWithPulsarKafkaClient";
+
+        StringSchema stringSchema = new StringSchema();
+        AvroSchema<Foo> fooSchema = AvroSchema.of(SchemaDefinition.<Foo>builder().withPojo(Foo.class).build());
+
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getPlainTextServiceUrl());
+        props.put("group.id", "my-subscription-name");
+        props.put("enable.auto.commit", "false");
+        props.put("key.deserializer", StringDeserializer.class.getName());
+        props.put("value.deserializer", StringDeserializer.class.getName());
+
+        @Cleanup
+        Consumer<String, Foo> consumer = new KafkaConsumer<String, Foo>(props, new StringSchema(), fooSchema);
+        consumer.subscribe(Arrays.asList(topic));
+
+        @Cleanup
+        PulsarClient pulsarClient = PulsarClient.builder().serviceUrl(getPlainTextServiceUrl()).build();
+        org.apache.pulsar.client.api.Producer<Foo> pulsarProducer = pulsarClient.newProducer(fooSchema).topic(topic).create();
+
+        for (int i = 0; i < 10; i++) {
+            Foo foo = new Foo();
+            foo.setField1("field1");
+            foo.setField2("field2");
+            foo.setField3(i);
+            pulsarProducer.newMessage().keyBytes(stringSchema.encode(Integer.toString(i))).value(foo).send();
+        }
+
+        AtomicInteger received = new AtomicInteger();
+        while (received.get() < 10) {
+            ConsumerRecords<String, Foo> records = consumer.poll(100);
+            if (!records.isEmpty()) {
+                records.forEach(record -> {
+                    Assert.assertEquals(record.key(), Integer.toString(received.get()));
+                    Foo value = record.value();
+                    Assert.assertEquals(value.getField1(), "field1");
+                    Assert.assertEquals(value.getField2(), "field2");
+                    Assert.assertEquals(value.getField3(), received.get());
+                    received.incrementAndGet();
+                });
+
+                consumer.commitSync();
+            }
+        }
+    }
+
+    @Test
+    public void testProducerConsumerAvroSchemaWithPulsarKafkaClient() throws Exception {
+        String topic = "testProducerConsumerAvroSchemaWithPulsarKafkaClient";
+
+        AvroSchema<Bar> barSchema = AvroSchema.of(SchemaDefinition.<Bar>builder().withPojo(Bar.class).build());
+        AvroSchema<Foo> fooSchema = AvroSchema.of(SchemaDefinition.<Foo>builder().withPojo(Foo.class).build());
+
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getPlainTextServiceUrl());
+        props.put("group.id", "my-subscription-name");
+        props.put("enable.auto.commit", "false");
+        props.put("key.serializer", IntegerSerializer.class.getName());
+        props.put("value.serializer", StringSerializer.class.getName());
+        props.put("key.deserializer", StringDeserializer.class.getName());
+        props.put("value.deserializer", StringDeserializer.class.getName());
+
+        @Cleanup
+        Consumer<Bar, Foo> consumer = new KafkaConsumer<>(props, barSchema, fooSchema);
+        consumer.subscribe(Arrays.asList(topic));
+
+        Producer<Bar, Foo> producer = new KafkaProducer<>(props, barSchema, fooSchema);
+
+        for (int i = 0; i < 10; i++) {
+            Bar bar = new Bar();
+            bar.setField1(true);
+
+            Foo foo = new Foo();
+            foo.setField1("field1");
+            foo.setField2("field2");
+            foo.setField3(i);
+            producer.send(new ProducerRecord<>(topic, bar, foo));
+        }
+        producer.flush();
+        producer.close();
+
+        AtomicInteger received = new AtomicInteger();
+        while (received.get() < 10) {
+            ConsumerRecords<Bar, Foo> records = consumer.poll(100);
+            if (!records.isEmpty()) {
+                records.forEach(record -> {
+                    Bar key = record.key();
+                    Assert.assertTrue(key.isField1());
+                    Foo value = record.value();
+                    Assert.assertEquals(value.getField1(), "field1");
+                    Assert.assertEquals(value.getField2(), "field2");
+                    Assert.assertEquals(value.getField3(), received.get());
+                    received.incrementAndGet();
+                });
+
+                consumer.commitSync();
+            }
+        }
+    }
+
+    @Test
+    public void testProducerConsumerJsonSchemaWithPulsarKafkaClient() throws Exception {
+        String topic = "testProducerConsumerJsonSchemaWithPulsarKafkaClient";
+
+        JSONSchema<Bar> barSchema = JSONSchema.of(SchemaDefinition.<Bar>builder().withPojo(Bar.class).build());
+        JSONSchema<Foo> fooSchema = JSONSchema.of(SchemaDefinition.<Foo>builder().withPojo(Foo.class).build());
+
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getPlainTextServiceUrl());
+        props.put("group.id", "my-subscription-name");
+        props.put("enable.auto.commit", "false");
+        props.put("key.serializer", IntegerSerializer.class.getName());
+        props.put("value.serializer", StringSerializer.class.getName());
+        props.put("key.deserializer", StringDeserializer.class.getName());
+        props.put("value.deserializer", StringDeserializer.class.getName());
+
+        @Cleanup
+        Consumer<Bar, Foo> consumer = new KafkaConsumer<>(props, barSchema, fooSchema);
+        consumer.subscribe(Arrays.asList(topic));
+
+        Producer<Bar, Foo> producer = new KafkaProducer<>(props, barSchema, fooSchema);
+
+        for (int i = 0; i < 10; i++) {
+            Bar bar = new Bar();
+            bar.setField1(true);
+
+            Foo foo = new Foo();
+            foo.setField1("field1");
+            foo.setField2("field2");
+            foo.setField3(i);
+            producer.send(new ProducerRecord<>(topic, bar, foo));
+        }
+        producer.flush();
+        producer.close();
+
+        AtomicInteger received = new AtomicInteger();
+        while (received.get() < 10) {
+            ConsumerRecords<Bar, Foo> records = consumer.poll(100);
+            if (!records.isEmpty()) {
+                records.forEach(record -> {
+                    Bar key = record.key();
+                    Assert.assertTrue(key.isField1());
+                    Foo value = record.value();
+                    Assert.assertEquals(value.getField1(), "field1");
+                    Assert.assertEquals(value.getField2(), "field2");
+                    Assert.assertEquals(value.getField3(), received.get());
+                    received.incrementAndGet();
+                });
+
+                consumer.commitSync();
+            }
+        }
+    }
+
+    @Test
+    public void testProducerConsumerMixedSchemaWithPulsarKafkaClient() throws Exception {
+        String topic = "testProducerConsumerMixedSchemaWithPulsarKafkaClient";
+
+        Schema<String> keySchema = new PulsarKafkaSchema<>(new StringSerializer(), new StringDeserializer());
+        JSONSchema<Foo> valueSchema = JSONSchema.of(SchemaDefinition.<Foo>builder().withPojo(Foo.class).build());
+
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getPlainTextServiceUrl());
+        props.put("group.id", "my-subscription-name");
+        props.put("enable.auto.commit", "false");
+        props.put("key.serializer", IntegerSerializer.class.getName());
+        props.put("value.serializer", StringSerializer.class.getName());
+        props.put("key.deserializer", StringDeserializer.class.getName());
+        props.put("value.deserializer", StringDeserializer.class.getName());
+
+        @Cleanup
+        Consumer<String, Foo> consumer = new KafkaConsumer<>(props, keySchema, valueSchema);
+        consumer.subscribe(Arrays.asList(topic));
+
+        Producer<String, Foo> producer = new KafkaProducer<>(props, keySchema, valueSchema);
+
+        for (int i = 0; i < 10; i++) {
+            Foo foo = new Foo();
+            foo.setField1("field1");
+            foo.setField2("field2");
+            foo.setField3(i);
+            producer.send(new ProducerRecord<>(topic, "hello" + i, foo));
+        }
+        producer.flush();
+        producer.close();
+
+        AtomicInteger received = new AtomicInteger();
+        while (received.get() < 10) {
+            ConsumerRecords<String, Foo> records = consumer.poll(100);
+            if (!records.isEmpty()) {
+                records.forEach(record -> {
+                    String key = record.key();
+                    Assert.assertEquals(key, "hello" + received.get());
+                    Foo value = record.value();
+                    Assert.assertEquals(value.getField1(), "field1");
+                    Assert.assertEquals(value.getField2(), "field2");
+                    Assert.assertEquals(value.getField3(), received.get());
+                    received.incrementAndGet();
+                });
+
+                consumer.commitSync();
+            }
+        }
     }
 }

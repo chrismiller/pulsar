@@ -202,10 +202,10 @@ Map<BacklogQuota.BacklogQuotaType,BacklogQuota> quotas =
 
 #### pulsar-admin
 
-Use the [`remove-backlog-quotas`](reference-pulsar-admin.md#pulsar-admin-namespaces-remove-backlog-quota) subcommand and specify a namespace. Here's an example:
+Use the [`remove-backlog-quota`](reference-pulsar-admin.md#pulsar-admin-namespaces-remove-backlog-quota) subcommand and specify a namespace. Here's an example:
 
 ```shell
-$ pulsar-admin namespaces remove-backlog-quotas my-tenant/my-ns
+$ pulsar-admin namespaces remove-backlog-quota my-tenant/my-ns
 ```
 
 #### REST API
@@ -279,6 +279,6 @@ $ pulsar-admin namespaces get-message-ttl my-tenant/my-ns
 #### Java
 
 ```java
-admin.namespaces().get
+admin.namespaces().getNamespaceMessageTTL(namespace)
 ```
 

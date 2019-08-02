@@ -25,6 +25,10 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 
+import lombok.AllArgsConstructor;
+import lombok.NoArgsConstructor;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.pulsar.client.api.BatcherBuilder;
 import org.apache.pulsar.client.api.CompressionType;
 import org.apache.pulsar.client.api.CryptoKeyReader;
 import org.apache.pulsar.client.api.HashingScheme;
@@ -38,19 +42,22 @@ import com.google.common.collect.Sets;
 
 import lombok.Data;
 
+import static com.google.common.base.Preconditions.checkArgument;
+
 @Data
+@NoArgsConstructor
+@AllArgsConstructor
 public class ProducerConfigurationData implements Serializable, Cloneable {
 
     private static final long serialVersionUID = 1L;
 
     private String topicName = null;
-
     private String producerName = null;
     private long sendTimeoutMs = 30000;
     private boolean blockIfQueueFull = false;
     private int maxPendingMessages = 1000;
     private int maxPendingMessagesAcrossPartitions = 50000;
-    private MessageRoutingMode messageRoutingMode = MessageRoutingMode.RoundRobinPartition;
+    private MessageRoutingMode messageRoutingMode = null;
     private HashingScheme hashingScheme = HashingScheme.JavaStringHash;
 
     private ProducerCryptoFailureAction cryptoFailureAction = ProducerCryptoFailureAction.FAIL;
@@ -61,6 +68,8 @@ public class ProducerConfigurationData implements Serializable, Cloneable {
     private long batchingMaxPublishDelayMicros = TimeUnit.MILLISECONDS.toMicros(1);
     private int batchingMaxMessages = 1000;
     private boolean batchingEnabled = true; // enabled by default
+    @JsonIgnore
+    private BatcherBuilder batcherBuilder = BatcherBuilder.DEFAULT;
 
     @JsonIgnore
     private CryptoKeyReader cryptoKeyReader;
@@ -72,6 +81,8 @@ public class ProducerConfigurationData implements Serializable, Cloneable {
 
     // Cannot use Optional<Long> since it's not serializable
     private Long initialSequenceId = null;
+
+    private boolean autoUpdatePartitions = true;
 
     private SortedMap<String, String> properties = new TreeMap<>();
 
@@ -95,4 +106,36 @@ public class ProducerConfigurationData implements Serializable, Cloneable {
             throw new RuntimeException("Failed to clone ProducerConfigurationData", e);
         }
     }
+
+    public void setProducerName(String producerName) {
+        checkArgument(StringUtils.isNotBlank(producerName), "producerName cannot be blank");
+        this.producerName = producerName;
+    }
+
+    public void setMaxPendingMessages(int maxPendingMessages) {
+        checkArgument(maxPendingMessages > 0, "maxPendingMessages needs to be > 0");
+        this.maxPendingMessages = maxPendingMessages;
+    }
+
+    public void setMaxPendingMessagesAcrossPartitions(int maxPendingMessagesAcrossPartitions) {
+        checkArgument(maxPendingMessagesAcrossPartitions >= maxPendingMessages);
+        this.maxPendingMessagesAcrossPartitions = maxPendingMessagesAcrossPartitions;
+    }
+
+    public void setBatchingMaxMessages(int batchingMaxMessages) {
+        checkArgument(batchingMaxMessages > 1, "batchingMaxMessages needs to be > 1");
+        this.batchingMaxMessages = batchingMaxMessages;
+    }
+
+    public void setSendTimeoutMs(int sendTimeout, TimeUnit timeUnit) {
+        checkArgument(sendTimeout >= 0, "sendTimeout needs to be >= 0");
+        this.sendTimeoutMs = timeUnit.toMillis(sendTimeout);
+    }
+
+    public void setBatchingMaxPublishDelayMicros(long batchDelay, TimeUnit timeUnit) {
+        long delayInMs = timeUnit.toMillis(batchDelay);
+        checkArgument(delayInMs >= 1, "configured value for batch delay must be at least 1ms");
+        this.batchingMaxPublishDelayMicros = timeUnit.toMicros(batchDelay);
+    }
+
 }

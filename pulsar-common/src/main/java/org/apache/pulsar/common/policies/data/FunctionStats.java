@@ -18,15 +18,21 @@
  */
 package org.apache.pulsar.common.policies.data;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 import lombok.Data;
+import org.apache.pulsar.common.util.ObjectMapperFactory;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Consumer;
 
 @Data
+@JsonInclude(JsonInclude.Include.ALWAYS)
+@JsonPropertyOrder({ "receivedTotal", "processedSuccessfullyTotal", "systemExceptionsTotal", "userExceptionsTotal", "avgProcessLatency", "1min", "lastInvocation", "instances" })
 public class FunctionStats {
 
     /**
@@ -52,22 +58,28 @@ public class FunctionStats {
     /**
      * Average process latency for function
      **/
-    public double avgProcessLatency;
+    public Double avgProcessLatency;
+
+    @JsonProperty("1min")
+    public FunctionInstanceStats.FunctionInstanceStatsDataBase oneMin = new FunctionInstanceStats.FunctionInstanceStatsDataBase();
 
     /**
      * Timestamp of when the function was last invoked by any instance
      **/
-    public long lastInvocation;
+    public Long lastInvocation;
 
     @Data
+    @JsonInclude(JsonInclude.Include.ALWAYS)
+    @JsonPropertyOrder({ "instanceId", "metrics" })
     public static class FunctionInstanceStats {
 
         /** Instance Id of function instance **/
         public int instanceId;
 
         @Data
-        public static class FunctionInstanceStatsData {
-
+        @JsonInclude(JsonInclude.Include.ALWAYS)
+        @JsonPropertyOrder({ "receivedTotal", "processedSuccessfullyTotal", "systemExceptionsTotal", "userExceptionsTotal", "avgProcessLatency" })
+        public static class FunctionInstanceStatsDataBase {
             /**
              * Total number of records function received from source for instance
              **/
@@ -91,12 +103,21 @@ public class FunctionStats {
             /**
              * Average process latency for function for instance
              **/
-            public double avgProcessLatency;
+            public Double avgProcessLatency;
+        }
+
+        @Data
+        @JsonInclude(JsonInclude.Include.ALWAYS)
+        @JsonPropertyOrder({ "receivedTotal", "processedSuccessfullyTotal", "systemExceptionsTotal", "userExceptionsTotal", "avgProcessLatency", "1min", "lastInvocation", "userMetrics" })
+        public static class FunctionInstanceStatsData extends FunctionInstanceStatsDataBase {
+
+            @JsonProperty("1min")
+            public FunctionInstanceStatsDataBase oneMin = new FunctionInstanceStatsDataBase();
 
             /**
              * Timestamp of when the function was last invoked for instance
              **/
-            public long lastInvocation;
+            public Long lastInvocation;
 
             /**
              * Map of user defined metrics
@@ -115,24 +136,59 @@ public class FunctionStats {
 
     public FunctionStats calculateOverall() {
 
-        lastInvocation = 0;
-        instances.forEach(new Consumer<FunctionInstanceStats>() {
-            @Override
-            public void accept(FunctionInstanceStats functionInstanceStats) {
+        int nonNullInstances = 0;
+        int nonNullInstancesOneMin = 0;
+        for (FunctionInstanceStats functionInstanceStats : instances) {
                 FunctionInstanceStats.FunctionInstanceStatsData functionInstanceStatsData = functionInstanceStats.getMetrics();
                 receivedTotal += functionInstanceStatsData.receivedTotal;
                 processedSuccessfullyTotal += functionInstanceStatsData.processedSuccessfullyTotal;
                 systemExceptionsTotal += functionInstanceStatsData.systemExceptionsTotal;
                 userExceptionsTotal += functionInstanceStatsData.userExceptionsTotal;
-                avgProcessLatency += functionInstanceStatsData.avgProcessLatency;
-                if (functionInstanceStatsData.lastInvocation > lastInvocation) {
-                    lastInvocation = functionInstanceStatsData.lastInvocation;
+                if (functionInstanceStatsData.avgProcessLatency != null) {
+                    if (avgProcessLatency == null) {
+                        avgProcessLatency = 0.0;
+                    }
+                    avgProcessLatency += functionInstanceStatsData.avgProcessLatency;
+                    nonNullInstances ++;
                 }
 
+                oneMin.receivedTotal += functionInstanceStatsData.oneMin.receivedTotal;
+                oneMin.processedSuccessfullyTotal += functionInstanceStatsData.oneMin.processedSuccessfullyTotal;
+                oneMin.systemExceptionsTotal += functionInstanceStatsData.oneMin.systemExceptionsTotal;
+                oneMin.userExceptionsTotal += functionInstanceStatsData.oneMin.userExceptionsTotal;
+                if (functionInstanceStatsData.oneMin.avgProcessLatency != null) {
+                    if (oneMin.avgProcessLatency == null) {
+                        oneMin.avgProcessLatency = 0.0;
+                    }
+                    oneMin.avgProcessLatency += functionInstanceStatsData.oneMin.avgProcessLatency;
+                    nonNullInstancesOneMin ++;
+                }
+
+                if (functionInstanceStatsData.lastInvocation != null) {
+                    if (lastInvocation == null || functionInstanceStatsData.lastInvocation > lastInvocation) {
+                        lastInvocation = functionInstanceStatsData.lastInvocation;
+                    }
+                }
             }
-        });
+
         // calculate average from sum
-        avgProcessLatency = avgProcessLatency / instances.size();
+        if (nonNullInstances > 0) {
+            avgProcessLatency = avgProcessLatency / nonNullInstances;
+        } else {
+            avgProcessLatency = null;
+        }
+
+        // calculate 1min average from sum
+        if (nonNullInstancesOneMin > 0) {
+            oneMin.avgProcessLatency = oneMin.avgProcessLatency / nonNullInstancesOneMin;
+        } else {
+            oneMin.avgProcessLatency = null;
+        }
+
         return this;
+    }
+
+    public static FunctionStats decode (String json) throws IOException {
+        return ObjectMapperFactory.getThreadLocal().readValue(json, FunctionStats.class);
     }
 }

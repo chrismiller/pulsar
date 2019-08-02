@@ -20,6 +20,7 @@ package org.apache.pulsar.broker.service;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 
 import java.lang.reflect.Field;
@@ -29,13 +30,9 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.client.api.*;
 import org.apache.pulsar.client.api.Consumer;
-import org.apache.pulsar.client.api.ConsumerBuilder;
-import org.apache.pulsar.client.api.Message;
-import org.apache.pulsar.client.api.MessageId;
-import org.apache.pulsar.client.api.MessageRoutingMode;
 import org.apache.pulsar.client.api.Producer;
-import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.client.impl.ConsumerBase;
 import org.apache.pulsar.common.policies.data.TenantInfo;
 import org.slf4j.Logger;
@@ -146,7 +143,7 @@ public class ResendRequestTest extends BrokerTestBase {
 
         // 9. Calling resend after acking all messages - expectin 0 messages
         consumer.redeliverUnacknowledgedMessages();
-        assertEquals(consumer.receive(2000, TimeUnit.MILLISECONDS), null);
+        assertNull(consumer.receive(2000, TimeUnit.MILLISECONDS));
 
         // 10. Checking message contents
         for (int i = 0; i < totalMessages; i++) {
@@ -171,11 +168,14 @@ public class ResendRequestTest extends BrokerTestBase {
         assertEquals(topicRef.getProducers().size(), 1);
 
         // 2. Create consumer
-        ConsumerBuilder<byte[]> consumerBuilder = pulsarClient.newConsumer().topic(topicName)
+        Consumer<byte[]> consumer1 = pulsarClient.newConsumer().topic(topicName)
                 .subscriptionName(subscriptionName).receiverQueueSize(totalMessages / 2)
-                .subscriptionType(SubscriptionType.Shared);
-        Consumer<byte[]> consumer1 = consumerBuilder.subscribe();
-        Consumer<byte[]> consumer2 = consumerBuilder.subscribe();
+                .subscriptionType(SubscriptionType.Shared).subscribe();
+
+        PulsarClient newPulsarClient = newPulsarClient(lookupUrl.toString(), 0);// Creates new client connection
+        Consumer<byte[]> consumer2 = newPulsarClient.newConsumer().topic(topicName)
+                .subscriptionName(subscriptionName).receiverQueueSize(totalMessages / 2)
+                .subscriptionType(SubscriptionType.Shared).subscribe();
 
         // 3. Producer publishes messages
         for (int i = 0; i < totalMessages; i++) {
@@ -232,6 +232,7 @@ public class ResendRequestTest extends BrokerTestBase {
             message2 = consumer2.receive(200, TimeUnit.MILLISECONDS);
         } while (message1 != null || message2 != null);
         log.info("Additional received = " + receivedMessagesAfterRedelivery);
+        newPulsarClient.close();
         assertTrue(receivedMessagesAfterRedelivery > 0);
 
         assertEquals(receivedConsumer1 + receivedConsumer2, totalMessages);
@@ -486,10 +487,12 @@ public class ResendRequestTest extends BrokerTestBase {
             .messageRoutingMode(MessageRoutingMode.RoundRobinPartition).create();
 
         // 2. Create consumer
-        ConsumerBuilder<byte[]> consumerBuilder = pulsarClient.newConsumer().topic(topicName)
-                .subscriptionName(subscriptionName).receiverQueueSize(7).subscriptionType(SubscriptionType.Shared);
-        Consumer<byte[]> consumer1 = consumerBuilder.subscribe();
-        Consumer<byte[]> consumer2 = consumerBuilder.subscribe();
+        Consumer<byte[]> consumer1 = pulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .receiverQueueSize(7).subscriptionType(SubscriptionType.Shared).subscribe();
+
+        PulsarClient newPulsarClient = newPulsarClient(lookupUrl.toString(), 0);// Creates new client connection
+        Consumer<byte[]> consumer2 = newPulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .receiverQueueSize(7).subscriptionType(SubscriptionType.Shared).subscribe();
 
         // 3. producer publish messages
         for (int i = 0; i < totalMessages; i++) {
@@ -561,6 +564,7 @@ public class ResendRequestTest extends BrokerTestBase {
         log.info(key + " messageCount2 = " + messageCount2);
         log.info(key + " ackCount1 = " + ackCount1);
         log.info(key + " ackCount2 = " + ackCount2);
+        newPulsarClient.close();
         assertEquals(messageCount1 + messageCount2 + ackCount1, totalMessages);
     }
 
@@ -708,8 +712,8 @@ public class ResendRequestTest extends BrokerTestBase {
 
         message1 = consumer1.receive(500, TimeUnit.MILLISECONDS);
         message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
-        assertEquals(message1, null);
-        assertEquals(message2, null);
+        assertNull(message1);
+        assertNull(message2);
     }
 
     @SuppressWarnings("unchecked")
